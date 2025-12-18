@@ -30,9 +30,11 @@ def trace(phoneme_string: str):
         :return: Feature layer activations delta for the time slice.
         """
         i = slice_num_i
+        feature_values_clipped = np.clip(feature_values, 0, U)
+        phoneme_values_clipped = np.clip(phoneme_values, 0, U)
 
         # Update feature values
-        features_net = np.zeros_like(feature_values)
+        features_net = np.zeros_like(feature_values_clipped)
         # Input excitation
         for ind in input_indices[i]:
             phoneme = input_string[ind]
@@ -49,11 +51,11 @@ def trace(phoneme_string: str):
             for dim1 in range(7):
                 for dim2 in range(7):
                     if dim1 != dim2:
-                        features_net[n, dim1, :] -= FEATURE_INHIBITION * np.clip(feature_values[n, dim2, :], 0, U)
+                        features_net[n, dim1, :] -= FEATURE_INHIBITION * feature_values_clipped[n, dim2, :]
         
         # Top-down excitation from phoneme layer
         for ph_idx in range(len(PHONEMES)):
-            for unit_idx in range(phoneme_values.shape[1]):
+            for unit_idx in range(phoneme_values_clipped.shape[1]):
                 unit_centre_slice = phoneme_unit_to_slice(unit_idx)
                 window = range(max(unit_centre_slice - 2, 0), min(unit_centre_slice + 4, slice_num))
                 for f_idx, feature in enumerate(PHONEMIC_FEATURES[PHONEMES[ph_idx]]):
@@ -62,7 +64,7 @@ def trace(phoneme_string: str):
                     for i,w in enumerate(window):
                         window_weight = i if w < unit_centre_slice else (len(window) - 1 - i)
                         window_weight /= len(window) // 2
-                        features_net[w, f_idx, feature] += PHONEME_FEATURE_EXCITATION * window_weight * np.clip(phoneme_values[ph_idx, unit_idx], 0, U)
+                        features_net[w, f_idx, feature] += PHONEME_FEATURE_EXCITATION * window_weight * phoneme_values_clipped[ph_idx, unit_idx]
 
         # Update feature activations
         features_delta = f(feature_values, features_net, FEATURE_DECAY)
@@ -80,12 +82,17 @@ def trace(phoneme_string: str):
         :param slice_num: Total number of slices.
         :return: Phoneme layer activations delta for the time slice.
         """
+
+        feature_values_clipped = np.clip(feature_values, 0, U)
+        phoneme_values_clipped = np.clip(phoneme_values, 0, U)
+        word_values_clipped = np.clip(word_values, 0, U)
+
         # Phoneme layer delta calculations
-        phoneme_net = np.zeros_like(phoneme_values)
+        phoneme_net = np.zeros_like(phoneme_values_clipped)
         
         # Bottom-up excitation from feature layer
         for ph_idx in range(len(PHONEMES)):
-            for unit_idx in range(phoneme_values.shape[1]):
+            for unit_idx in range(phoneme_values_clipped.shape[1]):
                 unit_centre_slice = phoneme_unit_to_slice(unit_idx)
                 window = range(max(unit_centre_slice - 2, 0), min(unit_centre_slice + 4, slice_num))
                 for f_idx, feature in enumerate(PHONEMIC_FEATURES[PHONEMES[ph_idx]]):
@@ -94,32 +101,32 @@ def trace(phoneme_string: str):
                     for i,w in enumerate(window):
                         window_weight = i if w < unit_centre_slice else (len(window) - 1 - i)
                         window_weight /= len(window) // 2
-                        phoneme_net[ph_idx, unit_idx] += FEATURE_PHONEME_EXCITATION * window_weight * np.clip(feature_values[w, f_idx, feature], 0, U)
+                        phoneme_net[ph_idx, unit_idx] += FEATURE_PHONEME_EXCITATION * window_weight * feature_values_clipped[w, f_idx, feature]
             
         # Lateral inhibition between phoneme units
-        for unit_idx1 in range(phoneme_values.shape[1]):
+        for unit_idx1 in range(phoneme_values_clipped.shape[1]):
             match unit_idx1:
                 case 0:
                     for phoneme_idx in range(len(PHONEMES)):
                         phonemes_mask = np.ones(len(PHONEMES), dtype=bool)
                         phonemes_mask[phoneme_idx] = False
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1], 0, U))
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1 + 1], 0, U))
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1])
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1 + 1])
 
-                case _ if unit_idx1 == phoneme_values.shape[1] - 1:
+                case _ if unit_idx1 == phoneme_values_clipped.shape[1] - 1:
                     for phoneme_idx in range(len(PHONEMES)):
                         phonemes_mask = np.ones(len(PHONEMES), dtype=bool)
                         phonemes_mask[phoneme_idx] = False
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1], 0, U))
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1 - 1], 0, U))
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1])
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1 - 1])
 
                 case _:
                     for phoneme_idx in range(len(PHONEMES)):
                         phonemes_mask = np.ones(len(PHONEMES), dtype=bool)
                         phonemes_mask[phoneme_idx] = False
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1], 0, U))
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1 - 1], 0, U))
-                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(np.clip(phoneme_values[phonemes_mask, unit_idx1 + 1], 0, U))
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1])
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1 - 1])
+                        phoneme_net[phoneme_idx, unit_idx1] -= PHONEME_INHIBITION * 0.5 * np.sum(phoneme_values_clipped[phonemes_mask, unit_idx1 + 1])
 
         # Top-down excitation from word layer
         for n in range(slice_num):
@@ -132,7 +139,7 @@ def trace(phoneme_string: str):
                 for weight, units, phoneme in zip([slice[1] for slice in slices], phoneme_units, word):
                     for unit in units:
                         phoneme_idx = PHONEME_TO_INDEX[phoneme]
-                        phoneme_net[phoneme_idx, unit] += WORD_PHONEME_EXCITATION * weight * np.clip(word_values[n, w], 0, U)
+                        phoneme_net[phoneme_idx, unit] += WORD_PHONEME_EXCITATION * weight * word_values_clipped[n, w]
 
         phoneme_delta = f(phoneme_values, phoneme_net, PHONEME_DECAY)
 
@@ -149,21 +156,48 @@ def trace(phoneme_string: str):
         :param slice_num: Total number of slices.
         :return: Word layer activations delta for the time slice.
         """
+        phoneme_values_clipped = np.clip(phoneme_values, 0, U)
+        word_values_clipped = np.clip(word_values, 0, U)
+
+        word_net = np.zeros_like(word_values)
         # Word layer delta calculations
-        # Lateral inhibition between words
-        for n1 in range(slice_num):
-            for w1 in range(WORDS_NUM):
-                window_end = min(len(KNOWN_WORDS[w1]) * 6 + n1, slice_num)
-                window_start = n1
-                for n2 in range(slice_num):
-                    for w2 in range(WORDS_NUM):
-                        if w1 != w2 or n1 != n2:
-                            window_end2 = min(len(KNOWN_WORDS[w2]) * 6 + n2, slice_num)
-                            window_start2 = n2
-                            overlap = max(0, min(window_end, window_end2) - max(window_start, window_start2))
-                            overlap_coef = overlap / min(len(KNOWN_WORDS[w1]) * 6, len(KNOWN_WORDS[w2]) * 6)
-                            if overlap_coef > 0:
-                                word_values[n1, w1] -= WORD_INHIBITION * overlap_coef * np.clip(word_values[n2, w2], 0, U)
+        # Lateral inhibition between words (vectorized)
+        # For every (start_slice, word) pair we have an interval [start, end).
+        # Compute pairwise overlaps and apply inhibition in a single matrix multiply.
+        # Note: this builds a (P x P) overlap matrix where P = slice_num * WORDS_NUM.
+        durations = np.array([len(w) * 6 for w in KNOWN_WORDS], dtype=int)  # (WORDS_NUM,)
+        # Flattened indices for all (n, w) combinations
+        starts = np.repeat(np.arange(slice_num, dtype=int), WORDS_NUM)  # (P,)
+        word_idx = np.tile(np.arange(WORDS_NUM, dtype=int), slice_num)   # (P,)
+        ends = np.minimum(starts + durations[word_idx], slice_num)      # (P,)
+        min_durs = durations[word_idx]                                   # (P,)
+
+        P = starts.size
+        if P > 0:
+            # Pairwise overlap: overlap[i, j] = max(0, min(end_i, end_j) - max(start_i, start_j))
+            starts_col = starts[:, None]
+            ends_col = ends[:, None]
+            starts_row = starts[None, :]
+            ends_row = ends[None, :]
+
+            overlap = np.maximum(0, np.minimum(ends_col, ends_row) - np.maximum(starts_col, starts_row))
+
+            # Normalize by the minimum duration of the two words involved
+            min_len = np.minimum(min_durs[:, None], min_durs[None, :])
+            with np.errstate(divide='ignore', invalid='ignore'):
+                overlap_coef = np.zeros_like(overlap, dtype=float)
+                valid = min_len > 0
+                overlap_coef[valid] = overlap[valid] / min_len[valid]
+
+            # Exclude self-contribution (i == j)
+            np.fill_diagonal(overlap_coef, 0.0)
+
+            # Flatten clipped word values and multiply
+            word_clip = word_values_clipped.ravel()  # (P,)
+            # For each target i, inhibition is WORD_INHIBITION * sum_j overlap_coef[i,j] * word_clip[j]
+            inhibition_vec = WORD_INHIBITION * (overlap_coef @ word_clip)
+            inhibition_matrix = inhibition_vec.reshape(slice_num, WORDS_NUM)
+            word_net -= inhibition_matrix
         
         # Phoneme to word excitation
         for n in range(slice_num):
@@ -176,10 +210,10 @@ def trace(phoneme_string: str):
                 for weight, units, phoneme in zip([slice[1] for slice in slices], phoneme_units, word):
                     for unit in units:
                         phoneme_idx = PHONEME_TO_INDEX[phoneme]
-                        word_values[n, w] += PHONEME_WORD_EXCITATION * weight * np.clip(phoneme_values[phoneme_idx, unit], 0, U)
+                        word_net[n, w] += PHONEME_WORD_EXCITATION * weight * phoneme_values_clipped[phoneme_idx, unit]
 
         # Update word activations
-        word_delta = f(word_values, word_values, WORD_DECAY)
+        word_delta = f(word_values, word_net, WORD_DECAY)
         return word_delta
 
     feature_values_agg = []

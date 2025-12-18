@@ -44,6 +44,8 @@ def get_input_indices(slice_num: int, input_string: str) -> list:
             input_indices[-1].append(i2 * 2 + 1)
     return input_indices
 
+
+slice_to_phoneme_unit_cache = {}
 def slice_to_phoneme_unit(slice_idx: int, phoneme_num: int) -> list[int]:
     """
     Function mapping slice index to phoneme unit indices.
@@ -51,11 +53,15 @@ def slice_to_phoneme_unit(slice_idx: int, phoneme_num: int) -> list[int]:
     :param phoneme_num: Number of phoneme units.
     :return: List of phoneme unit indices active at this slice.
     """
+    if (slice_idx, phoneme_num) in slice_to_phoneme_unit_cache:
+        return slice_to_phoneme_unit_cache[(slice_idx, phoneme_num)]
+
     inds = []
     if slice_idx // 6 *2 < phoneme_num:
         inds.append(slice_idx // 6 * 2)
     if slice_idx >= 3 and (slice_idx-3) // 6 * 2 + 1 < phoneme_num:
         inds.append((slice_idx-3) // 6 * 2 + 1)
+    slice_to_phoneme_unit_cache[(slice_idx, phoneme_num)] = inds
     return inds
 
 def phoneme_unit_to_slice(unit_idx: int) -> int:

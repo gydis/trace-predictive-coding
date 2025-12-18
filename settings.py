@@ -17,8 +17,8 @@ WORD_PHONEME_EXCITATION = 0.03    # Top-down excitation of phoneme level from th
 
 with open('wordlist', 'r') as f:
     KNOWN_WORDS = [line.strip() for line in f.readlines()]
-# KNOWN_WORDS = KNOWN_WORDS[:20]
-KNOWN_WORDS = ["bar", "aba", "ark", "bark"]
+KNOWN_WORDS = KNOWN_WORDS[:20]
+# KNOWN_WORDS = ["bar", "aba", "ark", "bark"]
 WORD_TO_IND = {word: i for i, word in enumerate(KNOWN_WORDS)} # Mapping from words to indices
 WORDS_NUM = len(KNOWN_WORDS) # Number of words in the lexicon
 
