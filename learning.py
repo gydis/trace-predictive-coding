@@ -3,7 +3,9 @@ from joblib import Parallel, delayed
 from settings import *
 from utils import get_input_indices, f, slice_to_phoneme_unit, phoneme_unit_to_slice
 
-def trace(phoneme_string: str):
+def trace(phoneme_string: str, probes: list[tuple[str, int]] = []):
+
+    probe_inds = [(idx, WORD_TO_IND[w]) for w, idx in probes if w in WORD_TO_IND] # (time index, word_index)
 
     input_string = phoneme_string  # Input string
     slice_num = 11 + 7 * (len(input_string)-1) # Number of time slices
@@ -147,7 +149,8 @@ def trace(phoneme_string: str):
 
     def word_layer_update_delta(word_values: np.ndarray,
                                 phoneme_values: np.ndarray,
-                                slice_num: int) -> np.ndarray:
+                                slice_num: int,
+                                curr_slice: int = -1) -> np.ndarray:
         """
         Function updating word layer activations for step i.
         :param word_values: Current word layer activations.
@@ -161,6 +164,7 @@ def trace(phoneme_string: str):
 
         word_net = np.zeros_like(word_values)
         # Word layer delta calculations
+
         # Lateral inhibition between words (vectorized)
         # For every (start_slice, word) pair we have an interval [start, end).
         # Compute pairwise overlaps and apply inhibition in a single matrix multiply.
@@ -206,6 +210,9 @@ def trace(phoneme_string: str):
                 center_slices = [n + 6*i for i in range(len(word))]
                 slices = [(i-1, 0.5) for i in center_slices] + [(i, 1) for i in center_slices] + [(i+1, 0.5) for i in center_slices]
                 slices = list(filter(lambda x: 0 <= x[0] < slice_num, slices))
+                if (n, w) in probe_inds:
+                    print(f"Time: {curr_slice}, updated_slice: {n}")
+                    print(f"\tCenter slices: {slices}")
                 phoneme_units = [slice_to_phoneme_unit(slice[0], PHONEME_NUM) for slice in slices]
                 for weight, units, phoneme in zip([slice[1] for slice in slices], phoneme_units, word):
                     for unit in units:
@@ -219,6 +226,7 @@ def trace(phoneme_string: str):
     feature_values_agg = []
     phoneme_values_agg = []
     word_values_agg = []
+    probe_values = np.zeros((len(probe_inds), slice_num))
     for i in range(slice_num):
 
         # Compute phoneme and word deltas in parallel
@@ -226,11 +234,9 @@ def trace(phoneme_string: str):
             [
                 delayed(feature_layer_update_delta)(feature_values, phoneme_values, input_string, i, slice_num),
                 delayed(phoneme_layer_update_delta)(feature_values, phoneme_values, word_values, slice_num),
-                delayed(word_layer_update_delta)(word_values, phoneme_values, slice_num)
+                delayed(word_layer_update_delta)(word_values, phoneme_values, slice_num, i)
             ]
         )
-
-        word_values_delta = word_layer_update_delta(word_values, phoneme_values, slice_num)
 
         feature_values += feature_values_delta
         feature_values = np.clip(feature_values, L, U)
@@ -243,5 +249,7 @@ def trace(phoneme_string: str):
         word_values += word_values_delta
         word_values = np.clip(word_values, L, U)
         word_values_agg.append(word_values.copy())
+
+        probe_values[:, i] = word_values.flat[np.ravel_multi_index(np.array(probe_inds).T, word_values.shape)]
                 
-    return feature_values_agg, phoneme_values_agg, word_values_agg
+    return feature_values_agg, phoneme_values_agg, word_values_agg, probe_values
