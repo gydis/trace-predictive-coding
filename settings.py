@@ -12,12 +12,13 @@ PHONEME_FEATURE_EXCITATION = 0.00 # Top-down excitation of feature level from th
 FEATURE_PHONEME_EXCITATION = 0.02 # Bottom-up excitation of phoneme level from the features
 PHONEME_INHIBITION = 0.08         # Inhibition between phonemes
 WORD_INHIBITION = 0.03            # Inhibition between words
-PHONEME_WORD_EXCITATION = 0.05    # Bottom-up excitation of word level from the phonemes
-WORD_PHONEME_EXCITATION = 0.03    # Top-down excitation of phoneme level from the words
+PHONEME_WORD_EXCITATION = 0.08    # Bottom-up excitation of word level from the phonemes
+WORD_PHONEME_EXCITATION = 0    # Top-down excitation of phoneme level from the words
+WORD_SELF_EXCITATION = 0.1       # Self-excitation of words
 
 with open('wordlist', 'r') as f:
     KNOWN_WORDS = [line.strip() for line in f.readlines()]
-KNOWN_WORDS = KNOWN_WORDS[:100]
+# KNOWN_WORDS = KNOWN_WORDS[:100]
 # KNOWN_WORDS = ["bar", "aba", "ark", "bark"]
 WORD_TO_IND = {word: i for i, word in enumerate(KNOWN_WORDS)} # Mapping from words to indices
 WORDS_NUM = len(KNOWN_WORDS) # Number of words in the lexicon

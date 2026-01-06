@@ -5,7 +5,7 @@ from utils import get_input_indices, f, slice_to_phoneme_unit, phoneme_unit_to_s
 
 def trace(phoneme_string: str, probes: list[tuple[str, int]] = []):
 
-    probe_inds = [(idx, WORD_TO_IND[w]) for w, idx in probes if w in WORD_TO_IND] # (time index, word_index)
+    probe_inds = [(idx, WORD_TO_IND[w]) for w, idx in probes if w in WORD_TO_IND] if probes else [] # (time index, word_index)
 
     input_string = phoneme_string  # Input string
     slice_num = 11 + 7 * (len(input_string)-1) # Number of time slices
@@ -169,50 +169,60 @@ def trace(phoneme_string: str, probes: list[tuple[str, int]] = []):
         # For every (start_slice, word) pair we have an interval [start, end).
         # Compute pairwise overlaps and apply inhibition in a single matrix multiply.
         # Note: this builds a (P x P) overlap matrix where P = slice_num * WORDS_NUM.
-        durations = np.array([len(w) * 6 for w in KNOWN_WORDS], dtype=int)  # (WORDS_NUM,)
-        # Flattened indices for all (n, w) combinations
-        starts = np.repeat(np.arange(slice_num, dtype=int), WORDS_NUM)  # (P,)
-        word_idx = np.tile(np.arange(WORDS_NUM, dtype=int), slice_num)   # (P,)
-        ends = np.minimum(starts + durations[word_idx], slice_num)      # (P,)
-        min_durs = durations[word_idx]                                   # (P,)
+        # durations = np.array([len(w) * 6 for w in KNOWN_WORDS], dtype=int)  # (WORDS_NUM,)
+        # # Flattened indices for all (n, w) combinations
+        # starts = np.repeat(np.arange(slice_num, dtype=int), WORDS_NUM)  # (P,)
+        # word_idx = np.tile(np.arange(WORDS_NUM, dtype=int), slice_num)   # (P,)
+        # ends = np.minimum(starts + durations[word_idx], slice_num)      # (P,)
+        # min_durs = durations[word_idx]                                   # (P,)
 
-        P = starts.size
-        if P > 0:
-            # Pairwise overlap: overlap[i, j] = max(0, min(end_i, end_j) - max(start_i, start_j))
-            starts_col = starts[:, None]
-            ends_col = ends[:, None]
-            starts_row = starts[None, :]
-            ends_row = ends[None, :]
+        # P = starts.size
+        # if P > 0:
+        #     # Pairwise overlap: overlap[i, j] = max(0, min(end_i, end_j) - max(start_i, start_j))
+        #     starts_col = starts[:, None]
+        #     ends_col = ends[:, None]
+        #     starts_row = starts[None, :]
+        #     ends_row = ends[None, :]
 
-            overlap = np.maximum(0, np.minimum(ends_col, ends_row) - np.maximum(starts_col, starts_row))
+        #     overlap = np.maximum(0, np.minimum(ends_col, ends_row) - np.maximum(starts_col, starts_row))
 
-            # Normalize by the minimum duration of the two words involved
-            min_len = np.minimum(min_durs[:, None], min_durs[None, :])
-            with np.errstate(divide='ignore', invalid='ignore'):
-                overlap_coef = np.zeros_like(overlap, dtype=float)
-                valid = min_len > 0
-                overlap_coef[valid] = overlap[valid] / min_len[valid]
+        #     # Normalize by the minimum duration of the two words involved
+        #     min_len = np.minimum(min_durs[:, None], min_durs[None, :])
+        #     with np.errstate(divide='ignore', invalid='ignore'):
+        #         overlap_coef = np.zeros_like(overlap, dtype=float)
+        #         valid = min_len > 0
+        #         overlap_coef[valid] = overlap[valid] / min_len[valid]
 
-            # Exclude self-contribution (i == j)
-            np.fill_diagonal(overlap_coef, 0.0)
+        #     # Exclude self-contribution (i == j)
+        #     np.fill_diagonal(overlap_coef, -WORD_SELF_EXCITATION)
 
-            # Flatten clipped word values and multiply
-            word_clip = word_values_clipped.ravel()  # (P,)
-            # For each target i, inhibition is WORD_INHIBITION * sum_j overlap_coef[i,j] * word_clip[j]
-            inhibition_vec = WORD_INHIBITION * (overlap_coef @ word_clip)
-            inhibition_matrix = inhibition_vec.reshape(slice_num, WORDS_NUM)
-            word_net -= inhibition_matrix
+        #     # Flatten clipped word values and multiply
+        #     word_clip = np.maximum(0, word_values_clipped.ravel())  # (P,)
+        #     # For each target i, inhibition is WORD_INHIBITION * sum_j overlap_coef[i,j] * word_clip[j]
+        #     inhibition_vec = WORD_INHIBITION * (overlap_coef @ word_clip**2)
+        #     inhibition_matrix = inhibition_vec.reshape(slice_num, WORDS_NUM)
+        #     word_net -= inhibition_matrix
+        word_pool = np.zeros_like(word_values_clipped)
+        for n in range(slice_num):
+            for w in range(WORDS_NUM):
+                word = KNOWN_WORDS[w]
+                duration = len(word) * 6
+                start = n
+                end = min(start + duration, slice_num)
+                word_pool[n, w] += (word_values_clipped[start:end, :]**2).sum() - WORD_SELF_EXCITATION * (word_values_clipped[start:end, w]**2).sum()
+        word_net -= WORD_INHIBITION * word_pool
         
         # Phoneme to word excitation
+        weights = [0, 1/3, 2/3, 1, 2/3, 1/3, 0]
         for n in range(slice_num):
             for w in range(WORDS_NUM):
                 word = KNOWN_WORDS[w]
                 center_slices = [n + 6*i for i in range(len(word))]
-                slices = [(i-1, 0.5) for i in center_slices] + [(i, 1) for i in center_slices] + [(i+1, 0.5) for i in center_slices]
+                slices = [(slice-i, weights[i]) for i in range(-3, 4) for slice in center_slices]
                 slices = list(filter(lambda x: 0 <= x[0] < slice_num, slices))
-                if (n, w) in probe_inds:
-                    print(f"Time: {curr_slice}, updated_slice: {n}")
-                    print(f"\tCenter slices: {slices}")
+                # if (n, w) in probe_inds:
+                #     print(f"Time: {curr_slice}, updated_slice: {n}")
+                #     print(f"\tCenter slices: {slices}")
                 phoneme_units = [slice_to_phoneme_unit(slice[0], PHONEME_NUM) for slice in slices]
                 for weight, units, phoneme in zip([slice[1] for slice in slices], phoneme_units, word):
                     for unit in units:
@@ -250,6 +260,7 @@ def trace(phoneme_string: str, probes: list[tuple[str, int]] = []):
         word_values = np.clip(word_values, L, U)
         word_values_agg.append(word_values.copy())
 
-        probe_values[:, i] = word_values.flat[np.ravel_multi_index(np.array(probe_inds).T, word_values.shape)]
+        if probe_inds:
+            probe_values[:, i] = word_values.flat[np.ravel_multi_index(np.array(probe_inds).T, word_values.shape)]
                 
     return feature_values_agg, phoneme_values_agg, word_values_agg, probe_values
