@@ -916,7 +916,7 @@ class OutputLayer(PCLayer):
                 weight = weight_norm(self.weight, self.weight_norm)
             else:
                 weight = self.weight
-            bu_err = F.relu(F.linear(bu_err, weight))
+            bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err
             pred_err = bu_err
             if leakage is None:
@@ -925,7 +925,7 @@ class OutputLayer(PCLayer):
                 self.state = self.state + step * pred_err - leakage * step * self.state
             else:
                 self.state = self.state + step * pred_err
-            #self.state = torch.clamp(self.state, min=-0.1, max=None)
+            self.state = torch.clamp(self.state, min=-0.1, max=None)
         return self.state
 
     def backward(self):
@@ -941,11 +941,11 @@ class OutputLayer(PCLayer):
             weight = weight_norm(self.weight, self.weight_norm)
         else:
             weight = self.weight
-        reconstruction = F.relu(F.linear(self.state, weight.T, bias=self.bias))
+        reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        return reconstruction, 0
+        return F.relu(reconstruction), 0
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
