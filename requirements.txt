@@ -3,3 +3,6 @@ matplotlib
 ipykernel
 pandas
 joblib
+torch
+tqdm
+torchvision
