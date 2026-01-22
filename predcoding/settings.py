@@ -42,5 +42,5 @@ PHONEMIC_FEATURES = {
     '^' : [7, 8, 5, 1, 1, 8, 0],
     '-' : [0, 0, 0, 0, 0, 0, 0]
 }
-PHONEMIC_FEATURES = {k: np.array(v, dtype=int) - 1 for k, v in PHONEMIC_FEATURES.items()}  # Shift features to start from 0
+# PHONEMIC_FEATURES = {k: np.array(v, dtype=int) - 1 for k, v in PHONEMIC_FEATURES.items()}  # Shift features to start from 0
 PHONEME_TO_INDEX = {phoneme: i for i, phoneme in enumerate(PHONEMES)}

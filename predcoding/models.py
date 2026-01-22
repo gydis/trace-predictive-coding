@@ -179,7 +179,7 @@ class PCModel(torch.nn.Module):
             else:
                 losses.append(layer_loss)
             loss = loss + layer_loss
-        return loss, losses[::-1]
+        return reconstruction, loss, losses[::-1]
 
     def reset(self, batch_size=None):
         """Reset the state of all units to small randomized values.
@@ -198,6 +198,15 @@ class PCModel(torch.nn.Module):
         """Detach the hidden state of the model."""
         for layer in self.layers:
             layer.detach()
+
+    def detach_states(self):
+        """Detach layer state tensors to drop autograd history."""
+        for layer in self.layers:
+            for attr in ("state", "reconstruction", "td_err", "bu_err", "pred_err"):
+                if hasattr(layer, attr):
+                    value = getattr(layer, attr)
+                    if torch.is_tensor(value):
+                        setattr(layer, attr, value.detach())
 
     
 
@@ -384,8 +393,8 @@ def trace(num_words=None, max_word_length=None, batch_size=None, state_dict=None
     model = PCModel(
         dict(
             input = InputLayer(n_units=7, batch_size=batch_size),
-            phoneme_layer = FcLayer(n_in=7, n_units=128, batch_size=batch_size),
-            word_layer = FcLayer(n_in=128, n_units=num_words, batch_size=batch_size),
+            phoneme_layer = FcLayer(n_in=7, n_units=32, batch_size=batch_size),
+            word_layer = FcLayer(n_in=32, n_units=num_words, batch_size=batch_size),
             output = OutputLayer(n_in=num_words, n_units=num_words, batch_size=batch_size),
         ),
         leakage=0,
