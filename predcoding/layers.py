@@ -125,6 +125,8 @@ class ConvLayer(PCLayer):
         Amount of top-down error to take into account.
     leakage : float
         Amount of activity lost every step.
+    use_weight_norm : bool
+        Whether to apply weight normalization to the forward and backward weights.
     """
 
     def __init__(
@@ -144,6 +146,7 @@ class ConvLayer(PCLayer):
         top_down=1.0,
         leakage=0,
         noise=0,
+        use_weight_norm=True,
     ):
         super().__init__(batch_size, top_down, leakage)
         self.in_channels = in_channels
@@ -166,6 +169,7 @@ class ConvLayer(PCLayer):
         self.shape = (batch_size, out_channels, self.out_height, self.out_width)
         self.n_units = torch.prod(torch.tensor(self.shape[1:])).item()
         self.noise = noise
+        self.use_weight_norm = use_weight_norm
 
         self.register_buffer("state", torch.zeros(self.shape))
         self.register_buffer(
@@ -238,7 +242,10 @@ class ConvLayer(PCLayer):
         self.bu_err = F.relu(self.state) - self.reconstruction
         self.td_err = -self.bu_err  # self.reconstruction - self.state
         if not self.clamped:
-            weight = weight_norm(self.weight, self.weight_norm)
+            if self.use_weight_norm:
+                weight = weight_norm(self.weight, self.weight_norm)
+            else:
+                weight = self.weight
             bu_err = F.conv2d(
                 bu_err,
                 weight,
@@ -283,7 +290,10 @@ class ConvLayer(PCLayer):
             that needs to be back-propagated.
         """
         self.reconstruction = reconstruction
-        weight = weight_norm(self.weight, self.weight_norm)
+        if self.use_weight_norm:
+            weight = weight_norm(self.weight, self.weight_norm)
+        else:
+            weight = self.weight
         reconstruction = F.conv_transpose2d(
             F.relu(self.state),
             weight,
@@ -348,6 +358,8 @@ class MiddleLayer(PCLayer):
         Amount of top-down error to take into account.
     leakage : float
         Amount of activity lost every step.
+    use_weight_norm : bool
+        Whether to apply weight normalization to the forward and backward weights.
     """
 
     def __init__(
@@ -359,6 +371,7 @@ class MiddleLayer(PCLayer):
         top_down=1.0,
         leakage=0,
         noise=0,
+        use_weight_norm=True,
     ):
         super().__init__(batch_size)
         self.n_units = n_units
@@ -366,6 +379,7 @@ class MiddleLayer(PCLayer):
         self.top_down = top_down
         self.leakage = leakage
         self.noise = noise
+        self.use_weight_norm = use_weight_norm
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
         self.register_buffer(
@@ -384,7 +398,7 @@ class MiddleLayer(PCLayer):
         else:
             self.bias = None
         self.weight_norm = nn.Parameter(torch.norm(self.weight, dim=1, keepdim=True))
-        # self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
+        self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -430,7 +444,10 @@ class MiddleLayer(PCLayer):
         self.td_err = -self.bu_err  # self.reconstruction - self.state
 
         if not self.clamped:
-            weight = weight_norm(self.weight, self.weight_norm)
+            if self.use_weight_norm:
+                weight = weight_norm(self.weight, self.weight_norm)
+            else:
+                weight = self.weight
             bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err
             if top_down is None:
@@ -468,8 +485,10 @@ class MiddleLayer(PCLayer):
             that needs to be back-propagated.
         """
         self.reconstruction = reconstruction
-        weight = weight_norm(self.weight, self.weight_norm)
-        # weight = sparse_norm(self.weight, self.sparse_norm)
+        weight = self.weight
+        if self.use_weight_norm:
+            weight = weight_norm(weight, self.weight_norm)
+        weight = sparse_norm(weight, self.sparse_norm)
         reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
@@ -528,6 +547,8 @@ class FcLayer(PCLayer):
         Amount of top-down error to take into account.
     leakage : float
         Amount of activity lost every step.
+    use_weight_norm : bool
+        Whether to apply weight normalization to the forward and backward weights.
     """
 
     def __init__(
@@ -539,6 +560,7 @@ class FcLayer(PCLayer):
         top_down=None,
         leakage=0,
         noise=0,
+        use_weight_norm=False,
     ):
         super().__init__(batch_size)
         self.n_units = n_units
@@ -546,6 +568,7 @@ class FcLayer(PCLayer):
         self.top_down = top_down
         self.leakage = leakage
         self.noise = noise
+        self.use_weight_norm = use_weight_norm
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
         self.register_buffer(
@@ -563,8 +586,11 @@ class FcLayer(PCLayer):
             nn.init.constant_(self.bias, 0)
         else:
             self.bias = None
-        self.weight_norm = nn.Parameter(torch.norm(self.weight, dim=1, keepdim=True))
-        # self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
+        if self.use_weight_norm:
+            self.weight_norm = nn.Parameter(
+                torch.norm(self.weight, dim=1, keepdim=True)
+            )
+        self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -610,8 +636,10 @@ class FcLayer(PCLayer):
         self.td_err = -self.bu_err  # self.reconstruction - self.state
 
         if not self.clamped:
-            weight = weight_norm(self.weight, self.weight_norm)
-            bu_err = F.relu(F.linear(bu_err, weight))
+            weight = self.weight
+            if self.use_weight_norm:
+                weight = weight_norm(weight, self.weight_norm)
+            bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err
             if top_down is None:
                 top_down = self.top_down
@@ -651,8 +679,9 @@ class FcLayer(PCLayer):
             from the layer above and the state of the layer.
         """
         self.reconstruction = reconstruction
-        weight = weight_norm(self.weight, self.weight_norm)
-        # weight = sparse_norm(self.weight, self.sparse_norm)
+        weight = self.weight
+        if self.use_weight_norm:
+            weight = weight_norm(weight, self.weight_norm)
         reconstruction = F.relu(F.linear(self.state, weight.T, bias=self.bias))
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()

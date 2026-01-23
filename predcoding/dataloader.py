@@ -4,7 +4,7 @@ import torch
 from settings import *
 
 class TraceDataset(Dataset):
-    def __init__(self, num_words):
+    def __init__(self, num_words=215):
         """
         Dataset for TRACE-like model.
 
@@ -42,3 +42,30 @@ class TraceDataset(Dataset):
             'index': self.word_indices[idx]
         }
 
+class PhonemeDataset(Dataset):
+    def __init__(self):
+        """
+        Dataset for phonemes.
+        """
+        self.phonemes = PHONEMES
+        self.phoneme_features = self._compute_phoneme_features()
+        self.phoneme_indices = torch.tensor(
+            [PHONEME_TO_INDEX[phoneme] for phoneme in self.phonemes],
+            dtype=torch.long
+        )
+
+    def _compute_phoneme_features(self):
+        features = []
+        for phoneme in self.phonemes:
+            features.append(torch.tensor(PHONEMIC_FEATURES[phoneme], dtype=torch.float32))
+        return features
+    
+    def __len__(self):
+        return len(self.phonemes)
+
+    def __getitem__(self, idx):
+        return {
+            'phoneme': self.phonemes[idx],
+            'features': self.phoneme_features[idx],
+            'index': self.phoneme_indices[idx]
+        }

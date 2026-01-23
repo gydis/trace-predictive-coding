@@ -321,7 +321,7 @@ def run_model(model, *, data, n_iter, targets, vectors=None, step=0.05):
         return errors, lex_acc
 
 
-def mnist(batch_size=None, state_dict=None):
+def mnist(batch_size=None, state_dict=None, use_weight_norm=True):
     """Construct a model for classifying the MNIST dataset.
 
     This is the original LeNet-5 architecture as described in:
@@ -337,6 +337,8 @@ def mnist(batch_size=None, state_dict=None):
     state_dict : dict | None
         State dict to initialize the model from. If not specified, you need to specify
         batch_size.
+    use_weight_norm : bool
+        Whether to apply weight normalization to all learnable layers.
     """
     model = PCModel(
         dict(
@@ -350,6 +352,7 @@ def mnist(batch_size=None, state_dict=None):
                 stride=1,
                 output_padding=0,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             pool1=AvgPoolLayer(kernel_size=2, batch_size=batch_size),
             conv2=ConvLayer(
@@ -361,6 +364,7 @@ def mnist(batch_size=None, state_dict=None):
                 stride=1,
                 output_padding=0,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             pool2=AvgPoolLayer(kernel_size=2, batch_size=batch_size),
             flatten=FlattenLayer(input_shape=(16, 5, 5), batch_size=batch_size),
@@ -368,9 +372,20 @@ def mnist(batch_size=None, state_dict=None):
                 16 * 5 * 5,
                 120,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
-            fc2=MiddleLayer(120, 84, batch_size=batch_size),
-            output=OutputLayer(84, 10, batch_size=batch_size),
+            fc2=MiddleLayer(
+                120,
+                84,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
+            output=OutputLayer(
+                84,
+                10,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
         ),
         leakage=0.2,
     )
@@ -380,7 +395,14 @@ def mnist(batch_size=None, state_dict=None):
 
     return model
 
-def trace(num_words=None, max_word_length=None, batch_size=None, state_dict=None):
+def trace(
+    num_words=None,
+    max_word_length=None,
+    batch_size=None,
+    noise=0.0,
+    state_dict=None,
+    use_weight_norm=True,
+):
     """Construct a predictive coding TRACE-like model for phoneme recognition.
     
     Parameters
@@ -389,13 +411,32 @@ def trace(num_words=None, max_word_length=None, batch_size=None, state_dict=None
         The number of stimuli per batch.
     num_words : int | None
         The number of words (output classes).
+    use_weight_norm : bool
+        Whether to apply weight normalization to all learnable layers.
     """
     model = PCModel(
         dict(
             input = InputLayer(n_units=7, batch_size=batch_size),
-            phoneme_layer = FcLayer(n_in=7, n_units=32, batch_size=batch_size),
-            word_layer = FcLayer(n_in=32, n_units=num_words, batch_size=batch_size),
-            output = OutputLayer(n_in=num_words, n_units=num_words, batch_size=batch_size),
+            phoneme_layer = FcLayer(
+                n_in=7,
+                n_units=48,
+                batch_size=batch_size,
+                noise=noise,
+                use_weight_norm=use_weight_norm,
+            ),
+            word_layer = FcLayer(
+                n_in=48,
+                n_units=num_words,
+                batch_size=batch_size,
+                noise=noise,
+                use_weight_norm=use_weight_norm,
+            ),
+            output = OutputLayer(
+                n_in=num_words,
+                n_units=num_words,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
         ),
         leakage=0,
         top_down=None,
@@ -408,7 +449,7 @@ def trace(num_words=None, max_word_length=None, batch_size=None, state_dict=None
     return model
 
 
-def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
+def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None, use_weight_norm=True):
     """Construct a model of visual word recoginition ending in a lexicon.
 
     First working version of the viswordrec model! Ends in a lexicon, rather than a
@@ -424,6 +465,8 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
     state_dict : dict | None
         State dict to initialize the model from. If not specified, you need to specify
         n_classes and batch_size.
+    use_weight_norm : bool
+        Whether to apply weight normalization to all learnable layers.
     """
     if state_dict is not None:
         batch_size, n_classes = state_dict["layers.lexicon.state"].shape
@@ -440,6 +483,7 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             conv2=ConvLayer(
                 in_channels=32,
@@ -451,6 +495,7 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             conv3=ConvLayer(
                 in_channels=64,
@@ -462,6 +507,7 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             conv4=ConvLayer(
                 in_channels=128,
@@ -473,10 +519,21 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             flatten=FlattenLayer(input_shape=(64, 4, 14), batch_size=batch_size),
-            fc=MiddleLayer(64 * 4 * 14, 1024, batch_size=batch_size),
-            lexicon=OutputLayer(1024, n_classes, batch_size=batch_size),
+            fc=MiddleLayer(
+                64 * 4 * 14,
+                1024,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
+            lexicon=OutputLayer(
+                1024,
+                n_classes,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
         ),
         leakage=0.35,
     )
@@ -487,7 +544,7 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None):
     return model
 
 
-def viswordrec_sem(vectors, batch_size=None, state_dict=None):
+def viswordrec_sem(vectors, batch_size=None, state_dict=None, use_weight_norm=True):
     """Construct a model of visual word recognition that ends with semanitcs.
 
     First somewhat working version of the viswordrec model that includes a semantic
@@ -502,6 +559,8 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None):
     state_dict : dict | None
         State dict to initialize the model from. If not specified, you need to specify
         n_classes and batch_size.
+    use_weight_norm : bool
+        Whether to apply weight normalization to all learnable layers.
     """
     if state_dict is not None:
         batch_size = state_dict["layers.semantics.state"].shape[0]
@@ -518,6 +577,7 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             conv2=ConvLayer(
                 in_channels=32,
@@ -529,6 +589,7 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             conv3=ConvLayer(
                 in_channels=64,
@@ -540,6 +601,7 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             conv4=ConvLayer(
                 in_channels=128,
@@ -551,15 +613,26 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None):
                 stride=2,
                 output_padding=1,
                 batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
             ),
             flatten=FlattenLayer(input_shape=(64, 4, 14), batch_size=batch_size),
-            fc=MiddleLayer(64 * 4 * 14, 1024, batch_size=batch_size),
-            lexicon=MiddleLayer(1024, vectors.shape[0], batch_size=batch_size),
+            fc=MiddleLayer(
+                64 * 4 * 14,
+                1024,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
+            lexicon=MiddleLayer(
+                1024,
+                vectors.shape[0],
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+            ),
             semantics=OutputLayer(
                 vectors.shape[0],
                 vectors.shape[1],
                 batch_size=batch_size,
-                use_weight_norm=True,
+                use_weight_norm=use_weight_norm,
             ),
         ),
         leakage=0.35,
