@@ -321,7 +321,7 @@ def run_model(model, *, data, n_iter, targets, vectors=None, step=0.05):
         return errors, lex_acc
 
 
-def mnist(batch_size=None, state_dict=None, use_weight_norm=True):
+def mnist(batch_size=None, state_dict=None, use_weight_norm=True, use_sparse_weight_norm=True):
     """Construct a model for classifying the MNIST dataset.
 
     This is the original LeNet-5 architecture as described in:
@@ -339,6 +339,8 @@ def mnist(batch_size=None, state_dict=None, use_weight_norm=True):
         batch_size.
     use_weight_norm : bool
         Whether to apply weight normalization to all learnable layers.
+    use_sparse_weight_norm : bool
+        Whether to apply sparse weight normalization to applicable layers.
     """
     model = PCModel(
         dict(
@@ -373,12 +375,14 @@ def mnist(batch_size=None, state_dict=None, use_weight_norm=True):
                 120,
                 batch_size=batch_size,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             fc2=MiddleLayer(
                 120,
                 84,
                 batch_size=batch_size,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             output=OutputLayer(
                 84,
@@ -402,6 +406,7 @@ def trace(
     noise=0.0,
     state_dict=None,
     use_weight_norm=True,
+    use_sparse_weight_norm=False,
 ):
     """Construct a predictive coding TRACE-like model for phoneme recognition.
     
@@ -413,6 +418,8 @@ def trace(
         The number of words (output classes).
     use_weight_norm : bool
         Whether to apply weight normalization to all learnable layers.
+    use_sparse_weight_norm : bool
+        Whether to apply sparse weight normalization to applicable layers.
     """
     model = PCModel(
         dict(
@@ -423,6 +430,7 @@ def trace(
                 batch_size=batch_size,
                 noise=noise,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             word_layer = FcLayer(
                 n_in=48,
@@ -430,6 +438,7 @@ def trace(
                 batch_size=batch_size,
                 noise=noise,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             output = OutputLayer(
                 n_in=num_words,
@@ -449,7 +458,13 @@ def trace(
     return model
 
 
-def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None, use_weight_norm=True):
+def viswordrec_lex(
+    n_classes=None,
+    batch_size=None,
+    state_dict=None,
+    use_weight_norm=True,
+    use_sparse_weight_norm=True,
+):
     """Construct a model of visual word recoginition ending in a lexicon.
 
     First working version of the viswordrec model! Ends in a lexicon, rather than a
@@ -467,6 +482,8 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None, use_weight_
         n_classes and batch_size.
     use_weight_norm : bool
         Whether to apply weight normalization to all learnable layers.
+    use_sparse_weight_norm : bool
+        Whether to apply sparse weight normalization to applicable layers.
     """
     if state_dict is not None:
         batch_size, n_classes = state_dict["layers.lexicon.state"].shape
@@ -527,6 +544,7 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None, use_weight_
                 1024,
                 batch_size=batch_size,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             lexicon=OutputLayer(
                 1024,
@@ -544,7 +562,13 @@ def viswordrec_lex(n_classes=None, batch_size=None, state_dict=None, use_weight_
     return model
 
 
-def viswordrec_sem(vectors, batch_size=None, state_dict=None, use_weight_norm=True):
+def viswordrec_sem(
+    vectors,
+    batch_size=None,
+    state_dict=None,
+    use_weight_norm=True,
+    use_sparse_weight_norm=True,
+):
     """Construct a model of visual word recognition that ends with semanitcs.
 
     First somewhat working version of the viswordrec model that includes a semantic
@@ -561,6 +585,8 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None, use_weight_norm=Tr
         n_classes and batch_size.
     use_weight_norm : bool
         Whether to apply weight normalization to all learnable layers.
+    use_sparse_weight_norm : bool
+        Whether to apply sparse weight normalization to applicable layers.
     """
     if state_dict is not None:
         batch_size = state_dict["layers.semantics.state"].shape[0]
@@ -621,12 +647,14 @@ def viswordrec_sem(vectors, batch_size=None, state_dict=None, use_weight_norm=Tr
                 1024,
                 batch_size=batch_size,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             lexicon=MiddleLayer(
                 1024,
                 vectors.shape[0],
                 batch_size=batch_size,
                 use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
             ),
             semantics=OutputLayer(
                 vectors.shape[0],

@@ -127,6 +127,8 @@ class ConvLayer(PCLayer):
         Amount of activity lost every step.
     use_weight_norm : bool
         Whether to apply weight normalization to the forward and backward weights.
+    use_sparse_weight_norm : bool
+        Whether to apply sparse weight normalization to the backward weights.
     """
 
     def __init__(
@@ -372,6 +374,7 @@ class MiddleLayer(PCLayer):
         leakage=0,
         noise=0,
         use_weight_norm=True,
+        use_sparse_weight_norm=True,
     ):
         super().__init__(batch_size)
         self.n_units = n_units
@@ -380,6 +383,7 @@ class MiddleLayer(PCLayer):
         self.leakage = leakage
         self.noise = noise
         self.use_weight_norm = use_weight_norm
+        self.use_sparse_weight_norm = use_sparse_weight_norm
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
         self.register_buffer(
@@ -488,7 +492,8 @@ class MiddleLayer(PCLayer):
         weight = self.weight
         if self.use_weight_norm:
             weight = weight_norm(weight, self.weight_norm)
-        weight = sparse_norm(weight, self.sparse_norm)
+        if self.use_sparse_weight_norm:
+            weight = sparse_norm(weight, self.sparse_norm)
         reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
@@ -549,6 +554,8 @@ class FcLayer(PCLayer):
         Amount of activity lost every step.
     use_weight_norm : bool
         Whether to apply weight normalization to the forward and backward weights.
+    use_sparse_weight_norm : bool
+        Whether to apply sparse weight normalization to the backward weights.
     """
 
     def __init__(
@@ -561,6 +568,7 @@ class FcLayer(PCLayer):
         leakage=0,
         noise=0,
         use_weight_norm=False,
+        use_sparse_weight_norm=False,
     ):
         super().__init__(batch_size)
         self.n_units = n_units
@@ -569,6 +577,7 @@ class FcLayer(PCLayer):
         self.leakage = leakage
         self.noise = noise
         self.use_weight_norm = use_weight_norm
+        self.use_sparse_weight_norm = use_sparse_weight_norm
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
         self.register_buffer(
@@ -682,6 +691,8 @@ class FcLayer(PCLayer):
         weight = self.weight
         if self.use_weight_norm:
             weight = weight_norm(weight, self.weight_norm)
+        if self.use_sparse_weight_norm:
+            weight = sparse_norm(weight, self.sparse_norm)
         reconstruction = F.relu(F.linear(self.state, weight.T, bias=self.bias))
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
