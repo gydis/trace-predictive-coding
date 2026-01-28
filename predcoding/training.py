@@ -29,6 +29,7 @@ class TraceTrainConfig:
     drop_last: bool = True
     use_tqdm: bool = True
     use_weight_norm: bool = True
+    use_sparse_weight_norm: bool = False
 
 
 @dataclass
@@ -109,6 +110,7 @@ def train_trace_model(
             batch_size=train_dataloader.batch_size,
             noise=config.noise,
             use_weight_norm=config.use_weight_norm,
+            use_sparse_weight_norm=config.use_sparse_weight_norm,
         )
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -226,6 +228,7 @@ def train_trace_model_legacy(
     steps_per_phoneme=5,
     step=0.05,
     use_weight_norm=True,
+    use_sparse_weight_norm=False,
 ):
     config = TraceTrainConfig(
         test_split=test_split,
@@ -237,6 +240,7 @@ def train_trace_model_legacy(
         steps_per_phoneme=steps_per_phoneme,
         step=step,
         use_weight_norm=use_weight_norm,
+        use_sparse_weight_norm=use_sparse_weight_norm,
     )
     return train_trace_model(config=config, model=model)
 
