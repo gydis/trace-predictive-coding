@@ -178,4 +178,37 @@ class MiddleLayer(LinearLayer):
 
 
 class OutputLayer(LinearLayer):
-    """Alias for a predictive linear layer at the top of a hierarchy."""
+    """Predictive linear layer at the top of a hierarchy.
+
+    `state_mode="softmax"` constrains the represented state to the simplex, which
+    improves identifiability for class-like output states.
+    """
+
+    def __init__(
+        self,
+        *args,
+        state_mode: str = "identity",
+        state_eps: float = 1e-6,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if state_mode not in {"identity", "softmax"}:
+            raise ValueError(f"Unsupported state_mode: {state_mode}")
+        if state_eps <= 0:
+            raise ValueError("state_eps must be positive.")
+        self.state_mode = state_mode
+        self.state_eps = float(state_eps)
+
+    def state_value(self) -> Tensor:
+        if self.state_mode == "softmax":
+            return torch.softmax(self.state, dim=-1)
+        return self.state
+
+    def clamp(self, state: Tensor) -> None:
+        if self.state_mode == "softmax":
+            probs = state.detach().clamp_min(self.state_eps)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(self.state_eps)
+            self.state = probs.log()
+            self.clamped = True
+            return
+        super().clamp(state)

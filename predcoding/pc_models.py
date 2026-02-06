@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import math
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -85,10 +86,16 @@ class PCModel(nn.Module):
         batch_size: int = 64,
         energy_reduction: str = "mean",
         init_scale: float = 0.0,
+        output_entropy_weight: float = 0.0,
+        output_balance_weight: float = 0.0,
+        output_prior_eps: float = 1e-8,
     ) -> None:
         super().__init__()
         self.batch_size = batch_size
         self.energy_reduction = energy_reduction
+        self.output_entropy_weight = float(output_entropy_weight)
+        self.output_balance_weight = float(output_balance_weight)
+        self.output_prior_eps = float(output_prior_eps)
 
         layers = _as_sequential(layers)
         if len(layers) < 2:
@@ -200,6 +207,35 @@ class PCModel(nn.Module):
                 per_layer.append(_precision_energy(error, precision, reduction))
             else:
                 per_layer.append(_reduce_error(error, reduction))
+
+        top_layer = self.layers[-1]
+        if (
+            self.output_entropy_weight > 0
+            and not top_layer.clamped
+            and hasattr(top_layer, "state_value")
+            and hasattr(top_layer, "state_mode")
+            and getattr(top_layer, "state_mode") == "softmax"
+        ):
+            probs = top_layer.state_value().clamp_min(self.output_prior_eps)
+            entropy = -(probs * probs.log()).sum(dim=1)
+            if reduction == "mean":
+                per_layer.append(self.output_entropy_weight * entropy.mean())
+            else:
+                per_layer.append(self.output_entropy_weight * entropy.sum())
+
+        if (
+            self.output_balance_weight > 0
+            and not top_layer.clamped
+            and hasattr(top_layer, "state_value")
+            and hasattr(top_layer, "state_mode")
+            and getattr(top_layer, "state_mode") == "softmax"
+        ):
+            probs = top_layer.state_value().clamp_min(self.output_prior_eps)
+            mean_probs = probs.mean(dim=0)
+            n_classes = mean_probs.numel()
+            uniform_log_prob = -math.log(float(n_classes))
+            kl_to_uniform = (mean_probs * (mean_probs.log() - uniform_log_prob)).sum()
+            per_layer.append(self.output_balance_weight * kl_to_uniform)
 
         total = sum(per_layer) if per_layer else self.layers[0].state.new_tensor(0.0)
         return total, per_layer
@@ -343,7 +379,10 @@ class PCModel(nn.Module):
 
     @property
     def output(self) -> Tensor:
-        return self.layers[-1].state
+        output_layer = self.layers[-1]
+        if hasattr(output_layer, "state_value"):
+            return output_layer.state_value()
+        return output_layer.state
 
 
 def trace(
@@ -359,6 +398,11 @@ def trace(
     learn_precision: bool = True,
     precision_init: float = 1.0,
     precision_eps: float = 1e-6,
+    output_state_mode: str = "softmax",
+    output_state_eps: float = 1e-6,
+    output_entropy_weight: float = 0.0,
+    output_balance_weight: float = 0.0,
+    output_prior_eps: float = 1e-8,
     include_output_layer: bool = True,
     weight_norm: Optional[float] = None,
     init_scale: float = 0.0,
@@ -394,7 +438,14 @@ def trace(
         precision_eps=precision_eps,
         weight_norm=weight_norm
     )
-    word_layer = MiddleLayer(**word_layer_kwargs)
+    if include_output_layer:
+        word_layer = MiddleLayer(**word_layer_kwargs)
+    else:
+        word_layer = OutputLayer(
+            **word_layer_kwargs,
+            state_mode=output_state_mode,
+            state_eps=output_state_eps,
+        )
 
     layers: Dict[str, nn.Module] = dict(
         input=InputLayer(n_units=input_units, batch_size=batch_size),
@@ -421,11 +472,16 @@ def trace(
             learn_precision=learn_precision,
             precision_init=precision_init,
             precision_eps=precision_eps,
+            state_mode=output_state_mode,
+            state_eps=output_state_eps,
         )
 
     model = PCModel(
         layers,
         init_scale=init_scale,
+        output_entropy_weight=output_entropy_weight,
+        output_balance_weight=output_balance_weight,
+        output_prior_eps=output_prior_eps,
     )
 
     if state_dict is not None:

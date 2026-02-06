@@ -33,6 +33,11 @@ class TracePCTrainConfig:
     learn_precision: bool = True
     precision_init: float = 1.0
     precision_eps: float = 1e-6
+    output_state_mode: str = "softmax"
+    output_state_eps: float = 1e-6
+    output_entropy_weight: float = 0.0
+    output_balance_weight: float = 0.0
+    output_prior_eps: float = 1e-8
     train_weight_every_phoneme: bool = False
     early_stop_on_train_acc: bool = False
     seed: Optional[int] = None
@@ -43,6 +48,8 @@ class TracePCTrainConfig:
     weight_norm: Optional[float] = None
     init_scale: float = 0.0
     label_force_every_phoneme: bool = False
+    train_acc_free_run: bool = True
+    use_supervised_energy_only: bool = True
 
 
 @dataclass
@@ -115,6 +122,25 @@ def _collect_precisions(model: PCModel) -> List[float]:
     return precisions
 
 
+def _infer_free_run_output(
+    model: PCModel,
+    *,
+    features: torch.Tensor,
+    inference: PCInferenceConfig,
+    steps_per_phoneme: int,
+    init_scale: float,
+) -> torch.Tensor:
+    """Run an unclamped forward dynamics pass and return output states."""
+    model.reset(init_scale=init_scale)
+    model.release_clamp()
+    seq_len = features.shape[1]
+    for step_idx in range(seq_len):
+        model.layers[0].clamp(features[:, step_idx, :])
+        model.layers[-1].release_clamp()
+        model.infer(config=inference, n_steps=steps_per_phoneme)
+    return model.output.detach()
+
+
 def train_trace_model(
     config: TracePCTrainConfig,
     model: Optional[PCModel] = None,
@@ -142,12 +168,17 @@ def train_trace_model(
             learn_precision=config.learn_precision,
             precision_init=config.precision_init,
             precision_eps=config.precision_eps,
+            output_state_mode=config.output_state_mode,
+            output_state_eps=config.output_state_eps,
+            output_entropy_weight=config.output_entropy_weight,
+            output_balance_weight=config.output_balance_weight,
+            output_prior_eps=config.output_prior_eps,
             include_output_layer=config.include_output_layer,
             weight_norm=config.weight_norm,
         )
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     history: Dict[str, List[float]] = {
         "free_energy": [],
         "grad_norm": [],
@@ -179,7 +210,7 @@ def train_trace_model(
 
             seq_len = features.shape[1]
             total_energy = torch.tensor(0.0, device=device)
-            output_pred = None
+            used_energy_terms = 0
 
             for step_idx in range(seq_len):
                 if config.label_force_every_phoneme:
@@ -195,20 +226,19 @@ def train_trace_model(
                 )
 
                 if step_idx == seq_len - 1:
-                    # Unclamped prediction for reporting accuracy.
-                    output_pred = model.output.detach()
                     if config.clamp_output_at_last_step:
                         model.layers[-1].clamp(labels)
                         model.infer(config=config.inference, n_steps=output_inference_steps)
 
+                supervised_step = model.layers[-1].clamped
                 if train_weight_every_phoneme:
+                    if config.use_supervised_energy_only and not supervised_step:
+                        continue
                     optimizer.zero_grad()
                     energy, _ = model.free_energy(reduction=energy_reduction)
-                    loss = F.cross_entropy(model.output, labels)
-                    C = energy.detach() / loss.detach()
-                    energy = energy + C * loss
                     energy.backward()
                     optimizer.step()
+                    used_energy_terms += 1
                     history["free_energy"].append(energy.item())
                     history["precision"].append(_collect_precisions(model))
                     grads = [
@@ -221,27 +251,40 @@ def train_trace_model(
                     model.normalize_weights()
                 else:
                     energy, _ = model.free_energy(reduction=energy_reduction)
-                    loss = F.cross_entropy(model.output, labels)
-                    C = energy.detach() / loss.detach()
-                    total_energy = total_energy + energy + C * loss
+                    if config.use_supervised_energy_only and not supervised_step:
+                        continue
+                    total_energy = total_energy + energy
+                    used_energy_terms += 1
 
             if not train_weight_every_phoneme:
-                total_energy = total_energy
-                total_energy.backward()
-                optimizer.step()
-                model.normalize_weights()
+                if used_energy_terms > 0:
+                    total_energy.backward()
+                    optimizer.step()
+                    model.normalize_weights()
 
-                history["free_energy"].append(total_energy.item())
-                history["precision"].append(_collect_precisions(model))
-                grads = [
-                    torch.linalg.norm(p.grad).item()
-                    for p in model.parameters()
-                    if p.grad is not None
-                ]
-                grad_norm = sum(grads) / len(grads) if grads else 0.0
-                history["grad_norm"].append(grad_norm)
+                    history["free_energy"].append(total_energy.item())
+                    history["precision"].append(_collect_precisions(model))
+                    grads = [
+                        torch.linalg.norm(p.grad).item()
+                        for p in model.parameters()
+                        if p.grad is not None
+                    ]
+                    grad_norm = sum(grads) / len(grads) if grads else 0.0
+                    history["grad_norm"].append(grad_norm)
+                else:
+                    history["free_energy"].append(0.0)
+                    history["precision"].append(_collect_precisions(model))
+                    history["grad_norm"].append(0.0)
 
-            if output_pred is None:
+            if config.train_acc_free_run:
+                output_pred = _infer_free_run_output(
+                    model,
+                    features=features,
+                    inference=config.inference,
+                    steps_per_phoneme=steps_per_phoneme,
+                    init_scale=config.init_scale,
+                )
+            else:
                 output_pred = model.output.detach()
             correct = output_pred.argmax(dim=1).eq(labels_ind).sum().item()
             accuracy = 100.0 * correct / len(labels_ind)
@@ -295,15 +338,13 @@ def evaluate_trace_model(
         labels_ind = batch["index"].to(device)
         original_words.extend(batch["word"])
 
-        model.reset()
-        model.release_clamp()
-        seq_len = features.shape[1]
-        for step_idx in range(seq_len):
-            model.layers[0].clamp(features[:, step_idx, :])
-            model.layers[-1].release_clamp()
-            model.infer(config=config.inference, n_steps=steps_per_phoneme)
-
-        pred = model.output.argmax(dim=1)
+        pred = _infer_free_run_output(
+            model,
+            features=features,
+            inference=config.inference,
+            steps_per_phoneme=steps_per_phoneme,
+            init_scale=config.init_scale,
+        ).argmax(dim=1)
         preds.append(pred)
         correct = preds[-1].eq(labels_ind).sum().item()
         accuracies.append(100.0 * correct / len(labels_ind))
