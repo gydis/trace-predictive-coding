@@ -694,6 +694,7 @@ class FcLayer(PCLayer):
         if self.use_sparse_weight_norm:
             weight = sparse_norm(weight, self.sparse_norm)
         reconstruction = F.relu(F.linear(self.state, weight.T, bias=self.bias))
+        # reconstruction = F.linear(self.state, weight.T, bias=self.bias)
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise

@@ -4,7 +4,7 @@ import torch
 from settings import *
 
 class TraceDataset(Dataset):
-    def __init__(self, num_words=215):
+    def __init__(self, num_words=215, mean_approx=False):
         """
         Dataset for TRACE-like model.
 
@@ -14,6 +14,7 @@ class TraceDataset(Dataset):
             The number of words in the dataset.
         """
         self.num_words = num_words
+        self.mean_approx = mean_approx
         self.words = KNOWN_WORDS[:num_words]
         self.max_word_length = max(len(word) for word in self.words)
         self.words_padded = [word + '-' * (self.max_word_length - len(word)) for word in self.words]
@@ -25,10 +26,14 @@ class TraceDataset(Dataset):
 
     def _compute_word_features(self):
         features = []
-        for word in self.words_padded:
+        for word in self.words_padded:#if not self.mean_approx else self.words:
             word_feat = []
             for phoneme in word:
                 word_feat.append(PHONEMIC_FEATURES[phoneme])
+            if self.mean_approx:
+                # word_feat = torch.tensor(word_feat, dtype=torch.float32).mean(dim=0, keepdim=True)
+                word_feat = [torch.tensor(i, dtype=torch.float32) for i in word_feat]
+                word_feat = torch.cat(word_feat, dim=0).unsqueeze(0)
             features.append(torch.tensor(word_feat, dtype=torch.float32))
         return features
     

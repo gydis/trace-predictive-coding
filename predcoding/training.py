@@ -23,6 +23,8 @@ class TraceTrainConfig:
     step: float = 0.05
     step_optimizer_per_phoneme: bool = False
     early_stop_on_train_acc: bool = False
+    state_dict_path: Optional[str] = None
+    state_dict_strict: bool = True
     seed: Optional[int] = None
     num_workers: int = 0
     pin_memory: Optional[bool] = None
@@ -89,6 +91,44 @@ def build_trace_dataloaders(
     return trace_dataset, train_dataloader, test_dataloader
 
 
+def load_trace_model(
+    *,
+    state_dict_path: str,
+    device: Optional[str] = None,
+    strict: bool = True,
+    num_words: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    noise: float = 0.0,
+    use_weight_norm: bool = True,
+    use_sparse_weight_norm: bool = False,
+) -> torch.nn.Module:
+    """Load a TRACE model from a saved state dict."""
+    resolved_device = _resolve_device(device)
+    state_dict = torch.load(state_dict_path, map_location=resolved_device)
+    if num_words is None:
+        output_state = state_dict.get("layers.output.state")
+        if output_state is not None:
+            num_words = output_state.shape[1]
+    if num_words is None:
+        raise ValueError("num_words must be provided if it cannot be inferred.")
+    if batch_size is None:
+        output_state = state_dict.get("layers.output.state")
+        if output_state is not None:
+            batch_size = output_state.shape[0]
+    if batch_size is None:
+        batch_size = 1
+    model = trace(
+        num_words=num_words,
+        max_word_length=None,
+        batch_size=batch_size,
+        noise=noise,
+        use_weight_norm=use_weight_norm,
+        use_sparse_weight_norm=use_sparse_weight_norm,
+    )
+    model.load_state_dict(state_dict, strict=strict)
+    return model.to(resolved_device)
+
+
 def train_trace_model(
     config: TraceTrainConfig,
     model: Optional[torch.nn.Module] = None,
@@ -103,7 +143,15 @@ def train_trace_model(
             raise ValueError("dataset is required when providing dataloaders.")
 
     device = _resolve_device(config.device)
+    state_dict = None
+    if config.state_dict_path is not None:
+        state_dict = torch.load(config.state_dict_path, map_location=device)
+
     if model is None:
+        if state_dict is not None and config.num_words is None:
+            output_state = state_dict.get("layers.output.state")
+            if output_state is not None:
+                config.num_words = output_state.shape[1]
         model = trace(
             num_words=config.num_words,
             max_word_length=dataset.max_word_length,
@@ -112,6 +160,8 @@ def train_trace_model(
             use_weight_norm=config.use_weight_norm,
             use_sparse_weight_norm=config.use_sparse_weight_norm,
         )
+    if state_dict is not None:
+        model.load_state_dict(state_dict, strict=config.state_dict_strict)
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     history: Dict[str, List[float]] = {

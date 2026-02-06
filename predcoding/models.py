@@ -82,7 +82,7 @@ class PCModel(torch.nn.Module):
 
         # make sure there are input/output layers
         assert isinstance(layers[0], InputLayer)
-        assert isinstance(layers[-1], OutputLayer)
+        # assert isinstance(layers[-1], OutputLayer)
 
         self.layers = layers
         self.eval()  # we're not learning weights
@@ -432,20 +432,20 @@ def trace(
                 use_weight_norm=use_weight_norm,
                 use_sparse_weight_norm=use_sparse_weight_norm,
             ),
-            word_layer = FcLayer(
+            output = OutputLayer(
                 n_in=48,
                 n_units=num_words,
                 batch_size=batch_size,
                 noise=noise,
-                use_weight_norm=use_weight_norm,
-                use_sparse_weight_norm=use_sparse_weight_norm,
+                # use_weight_norm=use_weight_norm,
+                # use_sparse_weight_norm=use_sparse_weight_norm,
             ),
-            output = OutputLayer(
-                n_in=num_words,
-                n_units=num_words,
-                batch_size=batch_size,
-                use_weight_norm=use_weight_norm,
-            ),
+            # output = OutputLayer(
+            #     n_in=num_words,
+            #     n_units=num_words,
+            #     batch_size=batch_size,
+            #     use_weight_norm=use_weight_norm,
+            # ),
         ),
         leakage=0,
         top_down=None,
