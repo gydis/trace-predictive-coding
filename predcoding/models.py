@@ -7,6 +7,7 @@ import torch
 from tqdm import tqdm
 
 from layers import (
+    BatchNormLayer,
     ConvLayer,
     FcLayer,
     FlattenLayer,
@@ -54,7 +55,7 @@ class PCModel(torch.nn.Module):
     """
 
     def __init__(
-        self, layers, batch_size=64, immediate=False, top_down=None, leakage=None
+        self, layers, batch_size=64, immediate=False, top_down=None, leakage=None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -407,6 +408,10 @@ def trace(
     state_dict=None,
     use_weight_norm=True,
     use_sparse_weight_norm=False,
+    leakage=0.,
+    top_down=0.,
+    clamp_negatives=False,
+    spectral_normalization=False,
 ):
     """Construct a predictive coding TRACE-like model for phoneme recognition.
     
@@ -421,22 +426,42 @@ def trace(
     use_sparse_weight_norm : bool
         Whether to apply sparse weight normalization to applicable layers.
     """
+    width = 45
     model = PCModel(
         dict(
             input = InputLayer(n_units=7, batch_size=batch_size),
             phoneme_layer = FcLayer(
                 n_in=7,
-                n_units=48,
+                n_units=15,
+                bias=True,
                 batch_size=batch_size,
                 noise=noise,
                 use_weight_norm=use_weight_norm,
                 use_sparse_weight_norm=use_sparse_weight_norm,
+                leakage=leakage,
+                relu_state=False,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
+
+            ),
+            memory_layer = FcLayer(
+                n_in=15,
+                n_units=width,
+                batch_size=batch_size,
+                noise=noise,
+                use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
             ),
             output = OutputLayer(
-                n_in=48,
+                n_in=width,
                 n_units=num_words,
                 batch_size=batch_size,
                 noise=noise,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
                 # use_weight_norm=use_weight_norm,
                 # use_sparse_weight_norm=use_sparse_weight_norm,
             ),
@@ -447,8 +472,83 @@ def trace(
             #     use_weight_norm=use_weight_norm,
             # ),
         ),
-        leakage=0,
-        top_down=None,
+        leakage=leakage,
+        top_down=top_down,
+    )
+
+    if state_dict is not None:
+        model.load_state_dict(state_dict)
+
+
+    return model
+
+def trace_cnn(
+    num_words=None,
+    max_word_length=None,
+    batch_size=None,
+    noise=0.0,
+    state_dict=None,
+    use_weight_norm=True,
+    use_sparse_weight_norm=False,
+    leakage=0.,
+    top_down=0.,
+    clamp_negatives=False,
+    spectral_normalization=False,
+    cnn_params=None
+):
+    width = 45
+    convolved_phonemes = 3
+    model = PCModel(
+        dict(
+            input = InputLayer(n_units=(7, 1, convolved_phonemes), batch_size=batch_size),
+            convolution_layer = ConvLayer(
+                in_channels=7,
+                out_channels=15,
+                in_height=1,
+                in_width=convolved_phonemes,
+                kernel_size=(1, convolved_phonemes),
+                padding=0,
+                stride=1,
+                dilation=1,
+                output_padding=0,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
+            ),
+            bn=BatchNormLayer(num_features=15, batch_size=batch_size),
+            flatten = FlattenLayer(input_shape=(15, 1, 1), batch_size=batch_size),
+            memory_layer = FcLayer(
+                n_in=15,
+                n_units=width,
+                batch_size=batch_size,
+                noise=noise,
+                use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
+            ),
+            output = OutputLayer(
+                n_in=width,
+                n_units=num_words,
+                batch_size=batch_size,
+                noise=noise,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                # use_weight_norm=use_weight_norm,
+                # use_sparse_weight_norm=use_sparse_weight_norm,
+            ),
+            # output = OutputLayer(
+            #     n_in=num_words,
+            #     n_units=num_words,
+            #     batch_size=batch_size,
+            #     use_weight_norm=use_weight_norm,
+            # ),
+        ),
+        leakage=leakage,
+        top_down=top_down,
     )
 
     if state_dict is not None:

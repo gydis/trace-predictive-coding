@@ -7,7 +7,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataloader import TraceDataset
-from models import trace
+from models import trace, trace_cnn
+from settings import PHONEME_TO_INDEX
 
 
 @dataclass
@@ -23,6 +24,7 @@ class TraceTrainConfig:
     step: float = 0.05
     step_optimizer_per_phoneme: bool = False
     early_stop_on_train_acc: bool = False
+    early_stop_threshold: float = 99.0
     state_dict_path: Optional[str] = None
     state_dict_strict: bool = True
     seed: Optional[int] = None
@@ -32,6 +34,20 @@ class TraceTrainConfig:
     use_tqdm: bool = True
     use_weight_norm: bool = True
     use_sparse_weight_norm: bool = False
+    phoneme_forcing: bool = False
+    leakage: float = 0.0
+    weight_decay: float = 0.0
+    top_down: float = 0.0
+    phoneme_memory_forcing: bool = False
+    clamp_negatives: bool = False
+    zero_steps: int = 0
+    gradient_clipping: float = 0.0
+    double_word_training: bool = False
+    spectral_normalization: bool = False
+    cnn: bool = False
+    cnn_params: Optional[Dict] = None
+    reset_model_each_batch: bool = False
+    mask_padding: bool = True
 
 
 @dataclass
@@ -42,6 +58,10 @@ class TraceTrainResult:
     val_dataloader: DataLoader
 
 
+# ---------------------------------------------------------------------------
+# Device / dataloader / model helpers
+# ---------------------------------------------------------------------------
+
 def _resolve_device(device: Optional[str]) -> str:
     if device is not None:
         return device
@@ -50,6 +70,7 @@ def _resolve_device(device: Optional[str]) -> str:
 
 def build_trace_dataloaders(
     config: TraceTrainConfig,
+    shuffle: bool = True,
 ) -> Tuple[TraceDataset, DataLoader, DataLoader]:
     trace_dataset = TraceDataset(config.num_words)
     train_size = int((1 - config.test_split) * len(trace_dataset))
@@ -75,7 +96,7 @@ def build_trace_dataloaders(
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         drop_last=config.drop_last,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
@@ -96,11 +117,10 @@ def load_trace_model(
     state_dict_path: str,
     device: Optional[str] = None,
     strict: bool = True,
+    config: TraceTrainConfig = None,
     num_words: Optional[int] = None,
     batch_size: Optional[int] = None,
-    noise: float = 0.0,
-    use_weight_norm: bool = True,
-    use_sparse_weight_norm: bool = False,
+    max_word_length: Optional[int] = None,
 ) -> torch.nn.Module:
     """Load a TRACE model from a saved state dict."""
     resolved_device = _resolve_device(device)
@@ -117,17 +137,455 @@ def load_trace_model(
             batch_size = output_state.shape[0]
     if batch_size is None:
         batch_size = 1
+    if max_word_length is None:
+        phoneme_layer_state = state_dict.get("layers.phoneme_layer.state")
+        if phoneme_layer_state is not None:
+            max_word_length = phoneme_layer_state.shape[1]
     model = trace(
-        num_words=num_words,
-        max_word_length=None,
+        num_words=config.num_words,
+        max_word_length=max_word_length,
         batch_size=batch_size,
-        noise=noise,
-        use_weight_norm=use_weight_norm,
-        use_sparse_weight_norm=use_sparse_weight_norm,
+        noise=config.noise,
+        use_weight_norm=config.use_weight_norm,
+        use_sparse_weight_norm=config.use_sparse_weight_norm,
+        leakage=config.leakage,
+        clamp_negatives=config.clamp_negatives,
     )
     model.load_state_dict(state_dict, strict=strict)
     return model.to(resolved_device)
 
+
+# ---------------------------------------------------------------------------
+# Training helpers
+# ---------------------------------------------------------------------------
+
+def _zero_input(features: torch.Tensor, cnn: bool, convolved_phonemes: int = 3) -> torch.Tensor:
+    if cnn:
+        # Shape: (B, n_features, 1, conv_ph) — matches InputLayer(n_units=(7, 1, conv_ph))
+        return torch.zeros(
+            features.shape[0], features.shape[2], 1, convolved_phonemes,
+            device=features.device,
+        )
+    return torch.zeros_like(features[:, 0, :])
+
+
+def _run_zero_steps(model, zero_inp: torch.Tensor, config: TraceTrainConfig) -> None:
+    for _ in range(config.zero_steps):
+        model.clamp(input_data=zero_inp)
+        model.backward()
+        model.forward(zero_inp, step=config.step)
+
+
+def _phoneme_forcing_loss(
+    model,
+    word_padded: List[str],
+    i: int,
+    config: TraceTrainConfig,
+    device: str,
+    seq_len: int,
+) -> torch.Tensor:
+    has_phoneme_layer = hasattr(model.layers, "phoneme_layer")
+    need_phoneme = (
+        config.phoneme_forcing
+        and has_phoneme_layer
+        and model.layers.phoneme_layer.state.shape[1] == 15
+    )
+    need_memory = config.phoneme_memory_forcing
+    if not (need_phoneme or need_memory):
+        return torch.tensor(0.0, device=device)
+
+    phoneme_indices = torch.tensor(
+        [PHONEME_TO_INDEX[word_padded[j][i]] for j in range(len(word_padded))],
+        dtype=torch.long,
+        device=device,
+    )
+    loss = torch.tensor(0.0, device=device)
+    if need_phoneme:
+        loss = loss + F.cross_entropy(
+            model.layers.phoneme_layer.state, phoneme_indices
+        ) / (config.steps_per_phoneme * seq_len)
+    if (
+        need_memory
+        and model.layers.memory_layer is not None
+        and model.layers.memory_layer.state.shape[1] == 15
+    ):
+        loss = loss + F.cross_entropy(
+            model.layers.memory_layer.state, phoneme_indices
+        ) / (config.steps_per_phoneme * seq_len)
+    return loss
+
+
+def _permute_batch(
+    features: torch.Tensor,
+    labels_ind: torch.Tensor,
+    word_padded: List[str],
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    perm = torch.randperm(features.size(0))
+    return (
+        features[perm].to(device),
+        labels_ind[perm].to(device),
+        [word_padded[j] for j in perm],
+    )
+
+
+def _compute_grad_norm(model) -> float:
+    grads = [
+        torch.linalg.norm(p.grad).item()
+        for p in model.parameters()
+        if p.grad is not None
+    ]
+    return sum(grads) / len(grads) if grads else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Default (end-of-batch) sequence runners
+# ---------------------------------------------------------------------------
+
+def _run_fc_sequence(
+    model,
+    features: torch.Tensor,
+    labels_ind: torch.Tensor,
+    lengths: torch.Tensor,
+    word_padded: List[str],
+    config: TraceTrainConfig,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list]:
+    """Process one full word sequence through the FC model.
+
+    Runs ``steps_per_phoneme`` backward/forward inference cycles for each
+    phoneme position, then one final cycle with zero input.
+
+    Returns ``(loss_fw, loss_bw, loss_phoneme, final_out, final_losses_list)``.
+    ``final_losses_list`` is the per-layer backward loss from the last cycle,
+    used for spectral normalisation.  ``loss_fw`` accumulation is controlled by
+    ``config.mask_padding``:
+
+    - ``True``:  accumulate only at positions where a word ends (current default).
+    - ``False``:  single cross-entropy on the zero-input final output.
+    """
+    seq_len = features.shape[1]
+    loss_fw = torch.tensor(0.0, device=device)
+    loss_bw = torch.tensor(0.0, device=device)
+    loss_phoneme = torch.tensor(0.0, device=device)
+    loss_bw_t = torch.tensor(0.0, device=device)
+    final_losses: list = []
+
+    for i in range(seq_len):
+        input_feat = features[:, i, :]
+        model.clamp(input_data=input_feat)
+        for _ in range(config.steps_per_phoneme):
+            _, loss_bw_t, final_losses = model.backward()
+            out = model.forward(input_feat, step=config.step)
+            loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
+                model, word_padded, i, config, device, seq_len
+            )
+
+        if config.mask_padding:
+            mask = lengths == i + 1
+            if mask.any():
+                loss_fw = loss_fw + F.cross_entropy(
+                    out[mask], labels_ind[mask], reduction="sum"
+                )
+                loss_bw = loss_bw + loss_bw_t
+
+    # Extra backward/forward with zeros — required for spectral normalisation
+    # and matches the original post-loop step.
+    zero_inp = _zero_input(features, cnn=False)
+    _, loss_bw_t, final_losses = model.backward()
+    out = model.forward(zero_inp, step=config.step)
+
+    if not config.mask_padding:
+        loss_fw = F.cross_entropy(out, labels_ind)
+        loss_bw = loss_bw_t
+
+    return loss_fw, loss_bw, loss_phoneme, out, final_losses
+
+
+def _run_cnn_sequence(
+    model,
+    features: torch.Tensor,
+    labels_ind: torch.Tensor,
+    lengths: torch.Tensor,
+    word_padded: List[str],
+    config: TraceTrainConfig,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list]:
+    """Process one full word sequence through the CNN model.
+
+    Identical structure to ``_run_fc_sequence`` but iterates over phoneme
+    positions in strides of ``convolved_phonemes`` and presents a windowed,
+    flattened input slice to the model at each position.
+
+    Returns ``(loss_fw, loss_bw, loss_phoneme, final_out, final_losses_list)``.
+    """
+    conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
+    seq_len = features.shape[1]
+    loss_fw = torch.tensor(0.0, device=device)
+    loss_bw = torch.tensor(0.0, device=device)
+    loss_phoneme = torch.tensor(0.0, device=device)
+    loss_bw_t = torch.tensor(0.0, device=device)
+    final_losses: list = []
+
+    # Start at conv_ph so the first window features[:, 0:conv_ph, :] is non-empty.
+    for i in range(conv_ph, seq_len + 1, conv_ph):
+        window = features[:, i - conv_ph:i, :]                   # (B, conv_ph, 7)
+        input_feat = window.permute(0, 2, 1).unsqueeze(2)        # (B, 7, 1, conv_ph)
+        model.clamp(input_data=input_feat)
+        for _ in range(config.steps_per_phoneme):
+            _, loss_bw_t, final_losses = model.backward()
+            out = model.forward(input_feat, step=config.step)
+            loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
+                model, word_padded, i, config, device, seq_len
+            )
+
+        if config.mask_padding:
+            mask = lengths == i
+            if mask.any():
+                loss_fw = loss_fw + F.cross_entropy(
+                    out[mask], labels_ind[mask], reduction="sum"
+                )
+                loss_bw = loss_bw + loss_bw_t
+
+    zero_inp = _zero_input(features, cnn=True, convolved_phonemes=conv_ph)
+    _, loss_bw_t, final_losses = model.backward()
+    out = model.forward(zero_inp, step=config.step)
+
+    if not config.mask_padding:
+        loss_fw = F.cross_entropy(out, labels_ind)
+        loss_bw = loss_bw_t
+
+    return loss_fw, loss_bw, loss_phoneme, out, final_losses
+
+
+# ---------------------------------------------------------------------------
+# Per-phoneme optimizer step sequence runners
+# ---------------------------------------------------------------------------
+
+def _run_fc_sequence_per_phoneme(
+    model,
+    features: torch.Tensor,
+    labels_ind: torch.Tensor,
+    lengths: torch.Tensor,
+    word_padded: List[str],
+    config: TraceTrainConfig,
+    device: str,
+    optimizer: torch.optim.Optimizer,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Process one full word sequence for the FC model, stepping the optimizer
+    after every individual inference step.
+
+    Returns ``(loss_fw, loss_bw, loss_phoneme, final_out, grad_norm)`` where
+    the loss tensors reflect the last phoneme position and are suitable for
+    logging only — weight updates have already been applied inside this function.
+    """
+    seq_len = features.shape[1]
+    loss_fw = torch.tensor(0.0, device=device)
+    loss_bw = torch.tensor(0.0, device=device)
+    loss_phoneme = torch.tensor(0.0, device=device)
+    out = None
+    grad_norm = 0.0
+
+    for i in range(seq_len):
+        input_feat = features[:, i, :]
+        model.clamp(input_data=input_feat)
+        for _ in range(config.steps_per_phoneme):
+            _, loss_bw_t, _ = model.backward()
+            out = model.forward(input_feat, step=config.step)
+            ph_loss = _phoneme_forcing_loss(model, word_padded, i, config, device, seq_len)
+            loss_phoneme = loss_phoneme + ph_loss
+
+            step_loss = loss_bw_t + ph_loss + F.cross_entropy(out, labels_ind)
+            step_loss.backward()
+            if config.gradient_clipping != 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+            grad_norm = _compute_grad_norm(model)
+            optimizer.step()
+            optimizer.zero_grad()
+            model.detach_states()
+
+        mask = lengths == i + 1
+        if mask.any():
+            loss_fw = loss_fw + F.cross_entropy(
+                out[mask], labels_ind[mask], reduction="sum"
+            )
+            loss_bw = loss_bw + loss_bw_t
+
+    return loss_fw, loss_bw, loss_phoneme, out, grad_norm
+
+
+def _run_cnn_sequence_per_phoneme(
+    model,
+    features: torch.Tensor,
+    labels_ind: torch.Tensor,
+    lengths: torch.Tensor,
+    word_padded: List[str],
+    config: TraceTrainConfig,
+    device: str,
+    optimizer: torch.optim.Optimizer,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Process one full word sequence for the CNN model, stepping the optimizer
+    after every individual inference step.
+
+    Returns ``(loss_fw, loss_bw, loss_phoneme, final_out, grad_norm)`` for
+    logging only — weight updates have already been applied inside this function.
+    """
+    conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
+    seq_len = features.shape[1]
+    loss_fw = torch.tensor(0.0, device=device)
+    loss_bw = torch.tensor(0.0, device=device)
+    loss_phoneme = torch.tensor(0.0, device=device)
+    out = None
+    grad_norm = 0.0
+
+    for i in range(conv_ph, seq_len + 1, conv_ph):
+        window = features[:, i - conv_ph:i, :]                   # (B, conv_ph, 7)
+        input_feat = window.permute(0, 2, 1).unsqueeze(2)        # (B, 7, 1, conv_ph)
+        model.clamp(input_data=input_feat)
+        for _ in range(config.steps_per_phoneme):
+            _, loss_bw_t, _ = model.backward()
+            out = model.forward(input_feat, step=config.step)
+            ph_loss = _phoneme_forcing_loss(model, word_padded, i, config, device, seq_len)
+            loss_phoneme = loss_phoneme + ph_loss
+
+            step_loss = loss_bw_t + ph_loss + F.cross_entropy(out, labels_ind)
+            step_loss.backward()
+            if config.gradient_clipping != 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+            grad_norm = _compute_grad_norm(model)
+            optimizer.step()
+            optimizer.zero_grad()
+            model.detach_states()
+
+        mask = lengths == i
+        if mask.any():
+            loss_fw = loss_fw + F.cross_entropy(
+                out[mask], labels_ind[mask], reduction="sum"
+            )
+            loss_bw = loss_bw + loss_bw_t
+
+    return loss_fw, loss_bw, loss_phoneme, out, grad_norm
+
+
+# ---------------------------------------------------------------------------
+# Batch training
+# ---------------------------------------------------------------------------
+
+def _train_batch(
+    model,
+    batch,
+    config: TraceTrainConfig,
+    device: str,
+    optimizer: torch.optim.Optimizer,
+    **kwargs,
+) -> Dict[str, float]:
+    words, features, labels_ind, word_padded = batch.values()
+    lengths = torch.tensor([len(w) for w in words], device=device)
+
+    if config.reset_model_each_batch:
+        model.reset()
+    else:
+        model.detach_states()
+    optimizer.zero_grad()
+
+    conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
+    n_passes = 2 if config.double_word_training else 1
+
+    # Accumulators across passes (end-of-batch mode only).
+    acc_loss_fw = torch.tensor(0.0, device=device)
+    acc_loss_bw = torch.tensor(0.0, device=device)
+    acc_loss_phoneme = torch.tensor(0.0, device=device)
+    final_out = None
+    final_losses_list: list = []
+
+    # Per-phoneme mode: keep only the last pass values for logging.
+    last_loss_fw = torch.tensor(0.0, device=device)
+    last_loss_bw = torch.tensor(0.0, device=device)
+    grad_norm = 0.0
+    accuracy = 0.0
+
+    for w in range(n_passes):
+        features, labels_ind, word_padded = _permute_batch(
+            features, labels_ind, word_padded, device
+        )
+        zero_inp = _zero_input(features, config.cnn, conv_ph)
+        _run_zero_steps(model, zero_inp, config)
+
+        if config.step_optimizer_per_phoneme:
+            if config.cnn:
+                loss_fw, loss_bw, loss_phoneme, out, grad_norm = (
+                    _run_cnn_sequence_per_phoneme(
+                        model, features, labels_ind, lengths, word_padded,
+                        config, device, optimizer,
+                    )
+                )
+            else:
+                loss_fw, loss_bw, loss_phoneme, out, grad_norm = (
+                    _run_fc_sequence_per_phoneme(
+                        model, features, labels_ind, lengths, word_padded,
+                        config, device, optimizer,
+                    )
+                )
+            last_loss_fw = loss_fw
+            last_loss_bw = loss_bw
+        else:
+            if config.cnn:
+                loss_fw, loss_bw, loss_phoneme, out, final_losses_list = (
+                    _run_cnn_sequence(
+                        model, features, labels_ind, lengths, word_padded,
+                        config, device,
+                    )
+                )
+            else:
+                loss_fw, loss_bw, loss_phoneme, out, final_losses_list = (
+                    _run_fc_sequence(
+                        model, features, labels_ind, lengths, word_padded,
+                        config, device,
+                    )
+                )
+            acc_loss_fw = acc_loss_fw + loss_fw
+            acc_loss_bw = acc_loss_bw + loss_bw
+            acc_loss_phoneme = acc_loss_phoneme + loss_phoneme
+            final_out = out
+
+        # accuracy += model.layers.output.state.argmax(dim=1).eq(labels_ind).sum().item()
+
+    if config.step_optimizer_per_phoneme:
+        loss = last_loss_fw + last_loss_bw
+    else:
+        if config.spectral_normalization:
+            denoms = [layer.denom for layer in model.layers if hasattr(layer, "denom")]
+            acc_loss_bw = torch.stack(
+                [(l / d).mean() for l, d in zip(final_losses_list, denoms)]
+            ).sum()
+            y = F.one_hot(labels_ind, num_classes=final_out.shape[1]).float()
+            delta = F.softmax(final_out, dim=-1) - y
+            c_L = (model.layers.output.weight ** 2).sum(dim=1)
+            acc_loss_fw = ((delta ** 2) / (c_L + 1e-6)).mean() + acc_loss_fw
+
+        loss = acc_loss_fw + acc_loss_phoneme + acc_loss_bw
+        loss.backward()
+        if config.gradient_clipping != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+        grad_norm = _compute_grad_norm(model)
+        optimizer.step()
+
+    # accuracy = (accuracy / (n_passes * labels_ind.shape[0])) * 100
+    accuracy, _, _ = evaluate_trace_model(model, kwargs["val_dataloader"], config)
+    log_fw = last_loss_fw if config.step_optimizer_per_phoneme else acc_loss_fw
+    log_bw = last_loss_bw if config.step_optimizer_per_phoneme else acc_loss_bw
+    return {
+        "loss": loss.item(),
+        "loss_fw": log_fw.item(),
+        "loss_bw": log_bw.item(),
+        "grad_norm": grad_norm,
+        "acc": accuracy,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main training entrypoint
+# ---------------------------------------------------------------------------
 
 def train_trace_model(
     config: TraceTrainConfig,
@@ -152,112 +610,55 @@ def train_trace_model(
             output_state = state_dict.get("layers.output.state")
             if output_state is not None:
                 config.num_words = output_state.shape[1]
-        model = trace(
+        model_kwargs = dict(
             num_words=config.num_words,
             max_word_length=dataset.max_word_length,
             batch_size=train_dataloader.batch_size,
             noise=config.noise,
             use_weight_norm=config.use_weight_norm,
             use_sparse_weight_norm=config.use_sparse_weight_norm,
+            leakage=config.leakage,
+            clamp_negatives=config.clamp_negatives,
+            spectral_normalization=config.spectral_normalization,
         )
+        model = trace_cnn(**model_kwargs, cnn_params=config.cnn_params) if config.cnn else trace(**model_kwargs)
+
     if state_dict is not None:
         model.load_state_dict(state_dict, strict=config.state_dict_strict)
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+
+    # optimizer = torch.optim.NAdam(
+    #     model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    # )
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
     history: Dict[str, List[float]] = {
-        "loss": [],
-        "loss_fw": [],
-        "loss_bw": [],
-        "grad_norm": [],
-        "acc": [],
-        "val_acc": [0.0],
+        "loss": [], "loss_fw": [], "loss_bw": [], "grad_norm": [], "acc": [], "val_acc": [0.0],
     }
     total_steps = config.epochs * len(train_dataloader)
     pbar = tqdm(total=total_steps, desc="Training") if config.use_tqdm else None
 
-    stop_training = False
-    for epoch in range(1, config.epochs + 1):
-        model.train()
-        for batch in train_dataloader:
-            words, features, labels_ind = batch.values()
-            labels = F.one_hot(labels_ind, num_classes=dataset.num_words).float()
-            features = features.to(device)
-            labels_ind = labels_ind.to(device)
-            labels = labels.to(device)
+    try:
+        for epoch in range(1, config.epochs + 1):
+            model.train()
+            for batch in train_dataloader:
+                metrics = _train_batch(model, batch, config, device, optimizer, val_dataloader=train_dataloader)
+                for key in ("loss", "loss_fw", "loss_bw", "grad_norm", "acc"):
+                    history[key].append(metrics[key])
+                if pbar is not None:
+                    pbar.set_description(
+                        f"Epoch {epoch}/{config.epochs} "
+                        f"Loss: {metrics['loss']:.4f} Acc: {metrics['acc']:.2f}, "
+                        f"Val {history['val_acc'][-1]:.2f}%"
+                    )
+                    pbar.update(1)
 
-            model.reset()
-            optimizer.zero_grad()
-
-            seq_len = features.shape[1]
-            loss_fw = torch.tensor(0.0, device=device)
-            loss_bw = torch.tensor(0.0, device=device)
-            grad_norm = 0.0
-            for i in range(seq_len):
-                for _ in range(config.steps_per_phoneme):
-                    model.clamp(input_data=features[:, i, :])
-                    _, loss_bw, _ = model.backward()
-                    out = model.forward(features[:, i, :], step=config.step)
-                    loss_fw = F.cross_entropy(out, labels)
-                    loss = loss_fw + loss_bw
-                    if config.step_optimizer_per_phoneme:
-                        loss.backward()
-                        grads_fw = [
-                            torch.linalg.norm(p.grad).item()
-                            for p in model.parameters()
-                            if p.grad is not None
-                        ]
-                        grad_norm = (
-                            sum(grads_fw) / len(grads_fw) if grads_fw else 0.0
-                        )
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        model.detach_states()
-
-            if config.step_optimizer_per_phoneme:
-                loss = loss_fw + loss_bw
-            else:
-                _, loss_bw, _ = model.backward()
-                out = model.forward(features[:, -1, :], step=config.step)
-                loss_fw = F.cross_entropy(out, labels)
-                loss = loss_fw + loss_bw
-                loss.backward()
-                optimizer.step()
-
-            history["loss"].append(loss.item())
-            history["loss_fw"].append(loss_fw.item())
-            history["loss_bw"].append(loss_bw.item())
-            if not config.step_optimizer_per_phoneme:
-                grads_fw = [
-                    torch.linalg.norm(p.grad).item()
-                    for p in model.parameters()
-                    if p.grad is not None
-                ]
-                grad_norm = sum(grads_fw) / len(grads_fw) if grads_fw else 0.0
-            history["grad_norm"].append(grad_norm)
-            correct = model.layers.output.state.argmax(dim=1).eq(labels_ind).sum().item()
-            accuracy = 100.0 * correct / len(labels_ind)
-            history["acc"].append(accuracy)
-
-            if pbar is not None:
-                pbar.set_description(
-                    f"Epoch {epoch}/{config.epochs} "
-                    f"Loss: {loss.item():.4f} Acc: {accuracy:.2f}, "
-                    f"Val {history['val_acc'][-1]:.2f}%"
-                )
-                pbar.update(1)
-
-            if config.early_stop_on_train_acc and accuracy >= 95.0:
-                stop_training = True
+            if config.early_stop_on_train_acc and metrics["acc"] >= config.early_stop_threshold:
                 break
-
-        if stop_training:
-            break
-
-        val_acc, _, _ = evaluate_trace_model(model, val_dataloader, config)
-        history["val_acc"].append(val_acc)
-
-    if pbar is not None:
-        pbar.close()
+    finally:
+        if pbar is not None:
+            pbar.close()
 
     return TraceTrainResult(
         model=model,
@@ -266,6 +667,10 @@ def train_trace_model(
         val_dataloader=val_dataloader,
     )
 
+
+# ---------------------------------------------------------------------------
+# Legacy / convenience wrappers
+# ---------------------------------------------------------------------------
 
 def train_trace_model_legacy(
     model=None,
@@ -299,30 +704,43 @@ def evaluate_trace_model(
     model: torch.nn.Module, test_dataloader: DataLoader, config: TraceTrainConfig
 ):
     device = _resolve_device(config.device)
+    conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
     model.eval()
     accuracies = []
     preds = []
     original_words = []
     with torch.no_grad():
         for batch in test_dataloader:
-            words, features, labels_ind = batch.values()
-            labels = F.one_hot(
-                labels_ind, num_classes=config.num_words
-            ).float().to(device)
+            words, features, labels_ind, words_padded = batch.values()
             features = features.to(device)
             labels_ind = labels_ind.to(device)
+            seq_len = features.shape[1]
 
             model.reset()
-            seq_len = features.shape[1]
-            for i in range(seq_len):
-                model.clamp(input_data=features[:, i, :])
-                for _ in range(config.steps_per_phoneme):
-                    _ = model.backward()
-                    _ = model.forward(features[:, i, :], step=config.step)
+            zero_inp = _zero_input(features, cnn=config.cnn, convolved_phonemes=conv_ph)
+            for _ in range(config.zero_steps):
+                model.clamp(input_data=zero_inp)
+                model.backward()
+                model.forward(zero_inp, step=config.step)
+
+            if config.cnn:
+                for i in range(conv_ph, seq_len + 1, conv_ph):
+                    inp = features[:, i - conv_ph:i, :].permute(0, 2, 1).unsqueeze(2)
+                    model.clamp(input_data=inp)
+                    for _ in range(config.steps_per_phoneme):
+                        model.backward()
+                        model.forward(inp, step=config.step)
+            else:
+                for i in range(seq_len):
+                    inp = features[:, i, :]
+                    model.clamp(input_data=inp)
+                    for _ in range(config.steps_per_phoneme):
+                        model.backward()
+                        model.forward(inp, step=config.step)
+
             preds.append(model.layers.output.state.argmax(dim=1))
             correct = preds[-1].eq(labels_ind).sum().item()
-            accuracy = 100.0 * correct / len(labels_ind)
-            accuracies.append(accuracy)
+            accuracies.append(100.0 * correct / len(labels_ind))
             original_words.extend(words)
     avg_acc = sum(accuracies) / len(accuracies) if accuracies else 0.0
     preds_tensor = torch.cat(preds, dim=0) if preds else torch.empty(0, dtype=torch.long)

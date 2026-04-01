@@ -44,7 +44,8 @@ class TraceDataset(Dataset):
         return {
             'word': self.words[idx],
             'features': self.word_features[idx],
-            'index': self.word_indices[idx]
+            'index': self.word_indices[idx],
+            'word_padded': self.words_padded[idx]
         }
 
 class PhonemeDataset(Dataset):

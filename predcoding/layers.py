@@ -104,6 +104,15 @@ class PCLayer(nn.Module):
         return []
 
 
+def _pair(x):
+    """Normalise a scalar or 2-element sequence to a ``(height, width)`` tuple."""
+    if isinstance(x, (tuple, list)):
+        if len(x) != 2:
+            raise ValueError(f"Expected a scalar or a 2-element sequence, got {x!r}")
+        return (int(x[0]), int(x[1]))
+    return (int(x), int(x))
+
+
 class ConvLayer(PCLayer):
     """A predictive-coding layer that performs 2d convolution.
 
@@ -149,29 +158,35 @@ class ConvLayer(PCLayer):
         leakage=0,
         noise=0,
         use_weight_norm=True,
+        clamp_negatives=False,
+        spectral_normalization=False,
     ):
         super().__init__(batch_size, top_down, leakage)
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size = kernel_size
+        self.kernel_size = _pair(kernel_size)
         self.in_height = in_height
         if in_width is None:
             in_width = in_height
         self.in_width = in_width
-        self.padding = padding
-        self.stride = stride
-        self.dilation = dilation
-        self.output_padding = output_padding
-        self.out_height = (
-            math.floor((self.in_height + (2 * padding) - kernel_size) / stride) + 1
-        )
-        self.out_width = (
-            math.floor((self.in_width + (2 * padding) - kernel_size) / stride) + 1
-        )
+        self.padding = _pair(padding)
+        self.stride = _pair(stride)
+        self.dilation = _pair(dilation)
+        self.output_padding = _pair(output_padding)
+
+        kH, kW = self.kernel_size
+        pH, pW = self.padding
+        sH, sW = self.stride
+        dH, dW = self.dilation
+        self.out_height = math.floor((in_height + 2 * pH - dH * (kH - 1) - 1) / sH + 1)
+        self.out_width = math.floor((self.in_width + 2 * pW - dW * (kW - 1) - 1) / sW + 1)
+
         self.shape = (batch_size, out_channels, self.out_height, self.out_width)
         self.n_units = torch.prod(torch.tensor(self.shape[1:])).item()
         self.noise = noise
         self.use_weight_norm = use_weight_norm
+        self.clamp_negatives = clamp_negatives
+        self.spectral_normalization = spectral_normalization
 
         self.register_buffer("state", torch.zeros(self.shape))
         self.register_buffer(
@@ -182,7 +197,7 @@ class ConvLayer(PCLayer):
         self.register_buffer("bu_err", torch.zeros(self.shape))
 
         self.weight = nn.Parameter(
-            torch.empty((out_channels, in_channels // groups, kernel_size, kernel_size))
+            torch.empty((out_channels, in_channels // groups, kH, kW))
         )
         if bias:
             self.bias = nn.Parameter(torch.empty(in_channels))
@@ -241,13 +256,26 @@ class ConvLayer(PCLayer):
         bu_err : tensor (batch_size, out_channels, out_width, out_width)
             The bottom-up error that needs to propagate to the next layer.
         """
-        self.bu_err = F.relu(self.state) - self.reconstruction
+        # self.bu_err = F.relu(self.state) - self.reconstruction
+        self.bu_err = self.state - self.reconstruction
         self.td_err = -self.bu_err  # self.reconstruction - self.state
         if not self.clamped:
             if self.use_weight_norm:
                 weight = weight_norm(self.weight, self.weight_norm)
             else:
                 weight = self.weight
+            if self.spectral_normalization:
+                # Treat conv as a matrix multiply by flattening weight to
+                # (out_ch, in_ch*kH*kW).  For kernels smaller than the input
+                # spatial extent, D is averaged over spatial positions first.
+                kH, kW = self.kernel_size
+                W_flat = self.weight.view(self.out_channels, -1)        # (out_ch, in_ch*kH*kW)
+                D_map = (bu_err > 0).float().mean(dim=0)                # (in_ch, in_H, in_W)
+                D_flat = D_map.mean(dim=(-2, -1))                       # (in_ch,)
+                D_kernel = D_flat.unsqueeze(-1).expand(-1, kH * kW).reshape(-1)  # (in_ch*kH*kW,)
+                c = (W_flat ** 2) @ D_kernel                            # (out_ch,)
+                c_out = (W_flat.T ** 2) @ torch.ones_like(c) / W_flat.shape[0]  # (in_ch*kH*kW,)
+                self.denom = c_out + (top_down or 0) + 1e-6
             bu_err = F.conv2d(
                 bu_err,
                 weight,
@@ -270,7 +298,8 @@ class ConvLayer(PCLayer):
                 self.state = self.state + step * pred_err - leakage * step * self.state
             else:
                 self.state = self.state + step * pred_err
-            self.state = torch.clamp(self.state, min=-0.1, max=None)
+            if self.clamp_negatives:
+                self.state = torch.clamp(self.state, min=-0.1, max=None)
         if immediate:
             return self.pred_err
         else:
@@ -297,7 +326,8 @@ class ConvLayer(PCLayer):
         else:
             weight = self.weight
         reconstruction = F.conv_transpose2d(
-            F.relu(self.state),
+            # F.relu(self.state),
+            self.state,
             weight,
             bias=self.bias,
             stride=self.stride,
@@ -309,8 +339,11 @@ class ConvLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        return F.relu(reconstruction), backward_loss(
-            self.reconstruction, F.relu(self.state)
+        # return F.relu(reconstruction), backward_loss(
+        #     self.reconstruction, F.relu(self.state)
+        # )
+        return reconstruction, backward_loss(
+            self.reconstruction, self.state
         )
 
     def clamp(self, state):
@@ -569,6 +602,9 @@ class FcLayer(PCLayer):
         noise=0,
         use_weight_norm=False,
         use_sparse_weight_norm=False,
+        relu_state = False,
+        clamp_negatives = False,
+        spectral_normalization = False,
     ):
         super().__init__(batch_size)
         self.n_units = n_units
@@ -578,6 +614,9 @@ class FcLayer(PCLayer):
         self.noise = noise
         self.use_weight_norm = use_weight_norm
         self.use_sparse_weight_norm = use_sparse_weight_norm
+        self.relu_state = relu_state
+        self.clamp_negatives = clamp_negatives
+        self.spectral_normalization = spectral_normalization
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
         self.register_buffer(
@@ -599,7 +638,8 @@ class FcLayer(PCLayer):
             self.weight_norm = nn.Parameter(
                 torch.norm(self.weight, dim=1, keepdim=True)
             )
-        self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
+        if self.use_sparse_weight_norm: 
+            self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -648,12 +688,20 @@ class FcLayer(PCLayer):
             weight = self.weight
             if self.use_weight_norm:
                 weight = weight_norm(weight, self.weight_norm)
+            if self.spectral_normalization:
+                D = (bu_err > 0).to(torch.float).mean(axis=0)
+                c = (self.weight**2) @ D
+                c_out = (self.weight.T**2) @ torch.ones_like(c) / self.weight.shape[0]
+                denom = c_out + top_down + 1e-6
+                self.denom = denom
             bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err
             if top_down is None:
                 top_down = self.top_down
             if top_down:
-                pred_err = self.pred_err + top_down * self.td_err
+                # g = torch.diag(1 / (torch.diag(weight @ torch.diag(D) @ weight.T) + top_down + 1e-6))
+                # pred_err = g @ (self.pred_err + top_down * self.td_err)
+                pred_err = (self.pred_err + top_down * self.td_err)
             else:
                 pred_err = self.pred_err
             # pred_err = pred_err / self.word_norm_fw
@@ -663,7 +711,8 @@ class FcLayer(PCLayer):
                 self.state = self.state + step * pred_err - leakage * step * self.state
             else:
                 self.state = self.state + step * pred_err
-            #self.state = torch.clamp(self.state, min=-0.1, max=None)
+            if self.clamp_negatives:
+                self.state = torch.clamp(self.state, min=-0.1, max=None)
         if immediate:
             return self.pred_err
         else:
@@ -693,7 +742,10 @@ class FcLayer(PCLayer):
             weight = weight_norm(weight, self.weight_norm)
         if self.use_sparse_weight_norm:
             weight = sparse_norm(weight, self.sparse_norm)
-        reconstruction = F.relu(F.linear(self.state, weight.T, bias=self.bias))
+        if not self.relu_state:
+            reconstruction = F.relu(F.linear(self.state, weight.T, bias=self.bias))
+        else:
+            reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         # reconstruction = F.linear(self.state, weight.T, bias=self.bias)
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
@@ -893,6 +945,7 @@ class OutputLayer(PCLayer):
         leakage=0,
         noise=0,
         use_weight_norm=True,
+        clamp_negatives=False,
     ):
         super().__init__(batch_size)
         self.n_in = n_in
@@ -900,6 +953,7 @@ class OutputLayer(PCLayer):
         self.leakage = leakage
         self.noise = noise
         self.use_weight_norm = use_weight_norm
+        self.clamp_negatives = clamp_negatives
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
 
@@ -957,16 +1011,20 @@ class OutputLayer(PCLayer):
                 weight = weight_norm(self.weight, self.weight_norm)
             else:
                 weight = self.weight
+            # D = (bu_err > 0).to(torch.float).mean(axis=0)
             bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err
             pred_err = bu_err
             if leakage is None:
                 leakage = self.leakage
             if leakage:
+                # g = torch.diag(1 / (torch.diag(weight @ torch.diag(D) @ weight.T) + 1e-6)) # (out, in) @ (b, in) @ (in, out) -> (out, out)
+                # pred_err = g @ (self.pred_err)
                 self.state = self.state + step * pred_err - leakage * step * self.state
             else:
                 self.state = self.state + step * pred_err
-            self.state = torch.clamp(self.state, min=-0.1, max=None)
+            if self.clamp_negatives:
+                self.state = torch.clamp(self.state, min=-0.1, max=None)
         return self.state
 
     def backward(self):
@@ -1161,6 +1219,181 @@ class AvgPoolLayer(PCLayer):
             Some extra information about this module.
         """
         return f"kernel_size={self.kernel_size}"
+
+
+class BatchNormLayer(PCLayer):
+    """A predictive-coding layer that performs batch normalization.
+
+    This is a stateless transformation layer — it has no PC dynamics, no state,
+    and contributes zero to the reconstruction loss. BN is an algebraically
+    invertible transformation and does not represent a latent variable in the
+    generative model. The forward pass normalizes the bottom-up error signal;
+    the backward pass applies the exact algebraic inverse to de-normalize the
+    top-down reconstruction.
+
+    Parameters
+    ----------
+    num_features : int
+        Number of channels C for 4D input (B, C, H, W), or number of features D
+        for 2D input (B, D). Must match the preceding layer's output channels.
+    eps : float
+        Small constant added to variance for numerical stability.
+    momentum : float
+        EMA momentum used to update running statistics.
+    affine : bool
+        If True (default), learns per-channel gamma (scale) and beta (shift)
+        parameters.
+    batch_size : int
+        Number of inputs per batch.
+    """
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, batch_size=1):
+        super().__init__(batch_size)
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+
+        if affine:
+            self.gamma = nn.Parameter(torch.ones(num_features))
+            self.beta = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.gamma = None
+            self.beta = None
+
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+
+        # Per-batch cache used by backward() to invert the normalization.
+        # Stored as plain attributes (not buffers) so they do not appear in
+        # state_dict. Initialized to identity (mean=0, std=1) so the first
+        # backward() call — which precedes the first forward() — passes the
+        # reconstruction through without distortion.
+        self._last_mean = torch.zeros(num_features)
+        self._last_std = torch.ones(num_features)
+
+    def reset(self, batch_size=None):
+        """Reset cached statistics to identity.
+
+        Parameters
+        ----------
+        batch_size : int | None
+            Optionally change the batch size from now on.
+        """
+        super().reset(batch_size)
+        device = self.running_mean.device
+        self._last_mean = torch.zeros(self.num_features, device=device)
+        self._last_std = torch.ones(self.num_features, device=device)
+
+    def forward(self, bu_err, step=0.1, top_down=None, leakage=None, immediate=False):
+        """Normalize and propagate prediction error forward.
+
+        Parameters
+        ----------
+        bu_err : tensor (batch_size, C, H, W) or (batch_size, D)
+            The bottom-up error computed in the previous layer.
+        step : float
+            Step size (unused, kept for interface compatibility).
+        top_down : float | None
+            Unused, kept for interface compatibility.
+        leakage : float | None
+            Unused, kept for interface compatibility.
+        immediate : bool
+            Unused, kept for interface compatibility.
+
+        Returns
+        -------
+        bu_err : tensor — same shape as input
+            The batch-normalized bottom-up error.
+        """
+        is_4d = bu_err.ndim == 4
+        dims = (0, 2, 3) if is_4d else (0,)
+
+        if self.training:
+            mean = bu_err.mean(dim=dims)
+            var = bu_err.var(dim=dims, unbiased=False)
+            std = torch.sqrt(var + self.eps)
+
+            # Cache for the inverse transform in backward(). Detached so the
+            # cached tensors do not keep the computation graph alive.
+            self._last_mean = mean.detach()
+            self._last_std = std.detach()
+
+            # EMA update of running statistics (no gradient).
+            with torch.no_grad():
+                self.running_mean.mul_(1 - self.momentum).add_(
+                    self.momentum * mean.detach()
+                )
+                self.running_var.mul_(1 - self.momentum).add_(
+                    self.momentum * var.detach()
+                )
+        else:
+            mean = self.running_mean
+            std = torch.sqrt(self.running_var + self.eps)
+            self._last_mean = mean
+            self._last_std = std
+
+        view_shape = (1, -1, 1, 1) if is_4d else (1, -1)
+        m = mean.view(view_shape)
+        s = std.view(view_shape)
+        out = (bu_err - m) / s
+
+        if self.affine:
+            g = self.gamma.view(view_shape)
+            b = self.beta.view(view_shape)
+            out = g * out + b
+
+        return out
+
+    def backward(self, reconstruction):
+        """De-normalize and back-propagate the reconstruction.
+
+        Applies the algebraic inverse of batch normalization using the statistics
+        cached during the most recent forward() call (or identity statistics if
+        forward() has not yet been called this batch).
+
+        Parameters
+        ----------
+        reconstruction : tensor — same shape as forward input
+            The reconstruction back-propagated from the next layer (in
+            normalized space).
+
+        Returns
+        -------
+        reconstruction : tensor — same shape
+            De-normalized reconstruction in the original error space.
+        loss : float
+            Always 0. BatchNormLayer is stateless and contributes no
+            reconstruction loss.
+        """
+        is_4d = reconstruction.ndim == 4
+        view_shape = (1, -1, 1, 1) if is_4d else (1, -1)
+
+        m = self._last_mean.view(view_shape)
+        s = self._last_std.view(view_shape)
+
+        if self.affine:
+            g = self.gamma.view(view_shape).clamp(min=1e-6)
+            b = self.beta.view(view_shape)
+            # Inverse of: y = g * (x - m) / s + b  →  x = (y - b) * s / g + m
+            reconstruction = (reconstruction - b) * s / g + m
+        else:
+            reconstruction = reconstruction * s + m
+
+        return reconstruction, 0
+
+    def extra_repr(self):
+        """Get some additional information about this module.
+
+        Returns
+        -------
+        out : str
+            Some extra information about this module.
+        """
+        return (
+            f"num_features={self.num_features}, eps={self.eps}, "
+            f"momentum={self.momentum}, affine={self.affine}"
+        )
 
 
 class AdaptivePoolLayer(PCLayer):
