@@ -574,12 +574,14 @@ def _train_batch(
     accuracy, _, _ = evaluate_trace_model(model, kwargs["val_dataloader"], config)
     log_fw = last_loss_fw if config.step_optimizer_per_phoneme else acc_loss_fw
     log_bw = last_loss_bw if config.step_optimizer_per_phoneme else acc_loss_bw
+    precisions = {f"layer_{i}": model.layers[i].pi.item() for i in range(len(model.layers)) if hasattr(model.layers[i], "pi")}
     return {
         "loss": loss.item(),
         "loss_fw": log_fw.item(),
         "loss_bw": log_bw.item(),
         "grad_norm": grad_norm,
         "acc": accuracy,
+        "precisions": precisions,
     }
 
 
@@ -634,7 +636,7 @@ def train_trace_model(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
     history: Dict[str, List[float]] = {
-        "loss": [], "loss_fw": [], "loss_bw": [], "grad_norm": [], "acc": [], "val_acc": [0.0],
+        "loss": [], "loss_fw": [], "loss_bw": [], "grad_norm": [], "acc": [], "val_acc": [0.0], "precisions": []
     }
     total_steps = config.epochs * len(train_dataloader)
     pbar = tqdm(total=total_steps, desc="Training") if config.use_tqdm else None
@@ -644,7 +646,7 @@ def train_trace_model(
             model.train()
             for batch in train_dataloader:
                 metrics = _train_batch(model, batch, config, device, optimizer, val_dataloader=train_dataloader)
-                for key in ("loss", "loss_fw", "loss_bw", "grad_norm", "acc"):
+                for key in ("loss", "loss_fw", "loss_bw", "grad_norm", "acc", "precisions"):
                     history[key].append(metrics[key])
                 if pbar is not None:
                     pbar.set_description(

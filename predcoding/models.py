@@ -517,7 +517,7 @@ def trace_cnn(
                 clamp_negatives=clamp_negatives,
                 spectral_normalization=spectral_normalization,
             ),
-            bn=BatchNormLayer(num_features=15, batch_size=batch_size),
+            # bn=BatchNormLayer(num_features=15, batch_size=batch_size),
             flatten = FlattenLayer(input_shape=(15, 1, 1), batch_size=batch_size),
             memory_layer = FcLayer(
                 n_in=15,

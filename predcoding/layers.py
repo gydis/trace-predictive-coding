@@ -641,6 +641,12 @@ class FcLayer(PCLayer):
         if self.use_sparse_weight_norm: 
             self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
 
+        self.log_pi = nn.Parameter(torch.zeros(1))
+
+    @property
+    def pi(self):
+        return torch.exp(self.log_pi)
+
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
 
@@ -708,9 +714,9 @@ class FcLayer(PCLayer):
             if leakage is None:
                 leakage = self.leakage
             if leakage:
-                self.state = self.state + step * pred_err - leakage * step * self.state
+                self.state = self.state + step * self.pi * pred_err - leakage * step * self.state
             else:
-                self.state = self.state + step * pred_err
+                self.state = self.state + step * self.pi * pred_err
             if self.clamp_negatives:
                 self.state = torch.clamp(self.state, min=-0.1, max=None)
         if immediate:
@@ -750,9 +756,9 @@ class FcLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        return reconstruction, backward_loss(
+        return reconstruction, self.pi * backward_loss(
             self.reconstruction, self.state
-        )
+        ) + torch.log(1/self.pi)
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
