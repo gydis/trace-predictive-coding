@@ -503,7 +503,7 @@ def trace_cnn(
             input = InputLayer(n_units=(7, 1, convolved_phonemes), batch_size=batch_size),
             convolution_layer = ConvLayer(
                 in_channels=7,
-                out_channels=15,
+                out_channels=24,
                 in_height=1,
                 in_width=convolved_phonemes,
                 kernel_size=(1, convolved_phonemes),
@@ -517,10 +517,10 @@ def trace_cnn(
                 clamp_negatives=clamp_negatives,
                 spectral_normalization=spectral_normalization,
             ),
-            # bn=BatchNormLayer(num_features=15, batch_size=batch_size),
-            flatten = FlattenLayer(input_shape=(15, 1, 1), batch_size=batch_size),
+            # bn=BatchNormLayer(num_features=24, batch_size=batch_size),
+            flatten = FlattenLayer(input_shape=(24, 1, 1), batch_size=batch_size),
             memory_layer = FcLayer(
-                n_in=15,
+                n_in=24,
                 n_units=width,
                 batch_size=batch_size,
                 noise=noise,

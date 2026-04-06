@@ -707,22 +707,22 @@ class FcLayer(PCLayer):
             if top_down:
                 # g = torch.diag(1 / (torch.diag(weight @ torch.diag(D) @ weight.T) + top_down + 1e-6))
                 # pred_err = g @ (self.pred_err + top_down * self.td_err)
-                pred_err = (self.pred_err + top_down * self.td_err)
+                pred_err = (self.pred_err + top_down * self.td_err * self.pi)
             else:
                 pred_err = self.pred_err
             # pred_err = pred_err / self.word_norm_fw
             if leakage is None:
                 leakage = self.leakage
             if leakage:
-                self.state = self.state + step * self.pi * pred_err - leakage * step * self.state
+                self.state = self.state + step * pred_err - leakage * step * self.state
             else:
-                self.state = self.state + step * self.pi * pred_err
+                self.state = self.state + step * pred_err
             if self.clamp_negatives:
                 self.state = torch.clamp(self.state, min=-0.1, max=None)
         if immediate:
             return self.pred_err
         else:
-            return self.bu_err
+            return self.bu_err * self.pi
 
     def backward(self, reconstruction):
         """Back-propagate the reconstruction.
@@ -758,7 +758,7 @@ class FcLayer(PCLayer):
             reconstruction = reconstruction + self.noise * noise
         return reconstruction, self.pi * backward_loss(
             self.reconstruction, self.state
-        ) + torch.log(1/self.pi)
+        ) + torch.log(2 * math.pi * 1 / self.pi)
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
