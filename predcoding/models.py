@@ -412,6 +412,7 @@ def trace(
     top_down=0.,
     clamp_negatives=False,
     spectral_normalization=False,
+    use_precision=False,
 ):
     """Construct a predictive coding TRACE-like model for phoneme recognition.
     
@@ -442,7 +443,7 @@ def trace(
                 relu_state=False,
                 clamp_negatives=clamp_negatives,
                 spectral_normalization=spectral_normalization,
-
+                use_precision=use_precision,
             ),
             memory_layer = FcLayer(
                 n_in=15,
@@ -454,6 +455,7 @@ def trace(
                 leakage=leakage,
                 clamp_negatives=clamp_negatives,
                 spectral_normalization=spectral_normalization,
+                use_precision=use_precision,
             ),
             output = OutputLayer(
                 n_in=width,
@@ -494,7 +496,8 @@ def trace_cnn(
     top_down=0.,
     clamp_negatives=False,
     spectral_normalization=False,
-    cnn_params=None
+    cnn_params=None,
+    use_precision=False,
 ):
     width = 45
     convolved_phonemes = 3
@@ -529,6 +532,7 @@ def trace_cnn(
                 leakage=leakage,
                 clamp_negatives=clamp_negatives,
                 spectral_normalization=spectral_normalization,
+                use_precision=use_precision,
             ),
             output = OutputLayer(
                 n_in=width,

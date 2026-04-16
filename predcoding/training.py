@@ -48,6 +48,8 @@ class TraceTrainConfig:
     cnn_params: Optional[Dict] = None
     reset_model_each_batch: bool = False
     mask_padding: bool = True
+    use_precision: bool = False
+    nadam_optimizer: bool = False
 
 
 @dataclass
@@ -56,6 +58,7 @@ class TraceTrainResult:
     history: Dict[str, List[float]]
     train_dataloader: DataLoader
     val_dataloader: DataLoader
+    config: TraceTrainConfig
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +290,7 @@ def _run_fc_sequence(
     loss_phoneme = torch.tensor(0.0, device=device)
     loss_bw_t = torch.tensor(0.0, device=device)
     final_losses: list = []
-    step_layer_losses: list = []
+    acc_layer_losses: list = []
 
     for i in range(seq_len):
         input_feat = features[:, i, :]
@@ -298,7 +301,6 @@ def _run_fc_sequence(
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
                 model, word_padded, i, config, device, seq_len
             )
-            step_layer_losses.append(list(final_losses))
 
         if config.mask_padding:
             mask = lengths == i + 1
@@ -307,19 +309,23 @@ def _run_fc_sequence(
                     out[mask], labels_ind[mask], reduction="sum"
                 )
                 loss_bw = loss_bw + loss_bw_t
+                if not acc_layer_losses:
+                    acc_layer_losses = list(final_losses)
+                else:
+                    acc_layer_losses = [a + b for a, b in zip(acc_layer_losses, final_losses)]
 
     # Extra backward/forward with zeros — required for spectral normalisation
     # and matches the original post-loop step.
     zero_inp = _zero_input(features, cnn=False)
     _, loss_bw_t, final_losses = model.backward()
     out = model.forward(zero_inp, step=config.step)
-    step_layer_losses.append(list(final_losses))
 
     if not config.mask_padding:
         loss_fw = F.cross_entropy(out, labels_ind)
         loss_bw = loss_bw_t
+        acc_layer_losses = final_losses
 
-    return loss_fw, loss_bw, loss_phoneme, out, step_layer_losses
+    return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
 
 
 def _run_cnn_sequence(
@@ -346,7 +352,7 @@ def _run_cnn_sequence(
     loss_phoneme = torch.tensor(0.0, device=device)
     loss_bw_t = torch.tensor(0.0, device=device)
     final_losses: list = []
-    step_layer_losses: list = []
+    acc_layer_losses: list = []
 
     # Start at conv_ph so the first window features[:, 0:conv_ph, :] is non-empty.
     for i in range(conv_ph, seq_len + 1, conv_ph):
@@ -359,7 +365,6 @@ def _run_cnn_sequence(
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
                 model, word_padded, i, config, device, seq_len
             )
-            step_layer_losses.append(list(final_losses))
 
         if config.mask_padding:
             mask = lengths == i
@@ -368,17 +373,21 @@ def _run_cnn_sequence(
                     out[mask], labels_ind[mask], reduction="sum"
                 )
                 loss_bw = loss_bw + loss_bw_t
+                if not acc_layer_losses:
+                    acc_layer_losses = list(final_losses)
+                else:
+                    acc_layer_losses = [a + b for a, b in zip(acc_layer_losses, final_losses)]
 
     zero_inp = _zero_input(features, cnn=True, convolved_phonemes=conv_ph)
     _, loss_bw_t, final_losses = model.backward()
     out = model.forward(zero_inp, step=config.step)
-    step_layer_losses.append(list(final_losses))
 
     if not config.mask_padding:
         loss_fw = F.cross_entropy(out, labels_ind)
         loss_bw = loss_bw_t
+        acc_layer_losses = final_losses
 
-    return loss_fw, loss_bw, loss_phoneme, out, step_layer_losses
+    return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
 
 
 # ---------------------------------------------------------------------------
@@ -558,21 +567,19 @@ def _train_batch(
             last_loss_bw = loss_bw
         else:
             if config.cnn:
-                loss_fw, loss_bw, loss_phoneme, out, pass_layer_losses = (
+                loss_fw, loss_bw, loss_phoneme, out, final_losses_list = (
                     _run_cnn_sequence(
                         model, features, labels_ind, lengths, word_padded,
                         config, device,
                     )
                 )
-                final_losses_list.extend(pass_layer_losses)
             else:
-                loss_fw, loss_bw, loss_phoneme, out, pass_layer_losses = (
+                loss_fw, loss_bw, loss_phoneme, out, final_losses_list = (
                     _run_fc_sequence(
                         model, features, labels_ind, lengths, word_padded,
                         config, device,
                     )
                 )
-                final_losses_list.extend(pass_layer_losses)
             acc_loss_fw = acc_loss_fw + loss_fw
             acc_loss_bw = acc_loss_bw + loss_bw
             acc_loss_phoneme = acc_loss_phoneme + loss_phoneme
@@ -606,9 +613,7 @@ def _train_batch(
     # accuracy = (accuracy / (n_passes * labels_ind.shape[0])) * 100
     log_fw = last_loss_fw if config.step_optimizer_per_phoneme else acc_loss_fw
     log_bw = last_loss_bw if config.step_optimizer_per_phoneme else acc_loss_bw
-    layer_backward_losses = [
-        {f"layer_{i}": v for i, v in enumerate(step)} for step in final_losses_list
-    ]
+    layer_backward_losses = {f"layer_{i}": v for i, v in enumerate(final_losses_list)}
     precisions = {f"layer_{i}": model.layers[i].pi.mean().item() for i in range(len(model.layers)) if hasattr(model.layers[i], "pi")}
     return {
         "loss": loss.item(),
@@ -660,6 +665,7 @@ def train_trace_model(
             leakage=config.leakage,
             clamp_negatives=config.clamp_negatives,
             spectral_normalization=config.spectral_normalization,
+            use_precision=config.use_precision,
         )
         model = trace_cnn(**model_kwargs, cnn_params=config.cnn_params) if config.cnn else trace(**model_kwargs)
 
@@ -667,12 +673,15 @@ def train_trace_model(
         model.load_state_dict(state_dict, strict=config.state_dict_strict)
     model = model.to(device)
 
-    # optimizer = torch.optim.NAdam(
-    #     model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    # )
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    )
+    if config.nadam_optimizer:
+        optimizer = torch.optim.NAdam(
+            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    else: 
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+
     history: Dict[str, List] = {
         "loss": [], "loss_fw": [], "loss_bw": [], "grad_norm": [], "acc": [], "val_acc": [0.0], "precisions": [],
         "layer_backward_losses": [], "layer_grad_norms": [], "layer_weight_norms": [],
@@ -687,11 +696,10 @@ def train_trace_model(
             for batch in train_dataloader:
                 metrics = _train_batch(model, batch, config, device, optimizer)
                 if epoch % 5 == 0:
-                    acc, _, _ = evaluate_trace_model(model, train_dataloader, config)
+                    acc, _, _, _ = evaluate_trace_model(model, train_dataloader, config)
                 for key in ("loss", "loss_fw", "loss_bw", "grad_norm", "acc", "precisions",
-                            "layer_grad_norms", "layer_weight_norms"):
+                            "layer_backward_losses", "layer_grad_norms", "layer_weight_norms"):
                     history[key].append(metrics[key])
-                history["layer_backward_losses"].extend(metrics["layer_backward_losses"])
                 history["acc"][-1] = acc
                 metrics["acc"] = acc
                 if pbar is not None:
@@ -713,6 +721,7 @@ def train_trace_model(
         history=history,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
+        config=config
     )
 
 
@@ -749,7 +758,7 @@ def train_trace_model_legacy(
 
 
 def evaluate_trace_model(
-    model: torch.nn.Module, test_dataloader: DataLoader, config: TraceTrainConfig
+    model: torch.nn.Module, test_dataloader: DataLoader, config: TraceTrainConfig, reset: bool = True
 ):
     device = _resolve_device(config.device)
     conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
@@ -764,7 +773,8 @@ def evaluate_trace_model(
             labels_ind = labels_ind.to(device)
             seq_len = features.shape[1]
 
-            model.reset()
+            if reset:
+                model.reset()
             zero_inp = _zero_input(features, cnn=config.cnn, convolved_phonemes=conv_ph)
             for _ in range(config.zero_steps):
                 model.clamp(input_data=zero_inp)
@@ -792,7 +802,7 @@ def evaluate_trace_model(
             original_words.extend(words)
     avg_acc = sum(accuracies) / len(accuracies) if accuracies else 0.0
     preds_tensor = torch.cat(preds, dim=0) if preds else torch.empty(0, dtype=torch.long)
-    return avg_acc, preds_tensor, original_words
+    return avg_acc, preds_tensor, original_words, preds[-1].eq(labels_ind).cpu().numpy() if preds else []
 
 
 def evaluate(
@@ -809,4 +819,5 @@ def evaluate(
         device=device,
         step=step,
     )
-    return evaluate_trace_model(model, test_dataloader, config)
+    avg_acc, preds_tensor, original_words, correct = evaluate_trace_model(model, test_dataloader, config)
+    return avg_acc, preds_tensor, original_words, correct

@@ -605,6 +605,7 @@ class FcLayer(PCLayer):
         relu_state = False,
         clamp_negatives = False,
         spectral_normalization = False,
+        use_precision=False,
     ):
         super().__init__(batch_size)
         self.n_units = n_units
@@ -617,6 +618,7 @@ class FcLayer(PCLayer):
         self.relu_state = relu_state
         self.clamp_negatives = clamp_negatives
         self.spectral_normalization = spectral_normalization
+        self.use_precision = use_precision
 
         self.register_buffer("state", torch.zeros((self.batch_size, self.n_units)))
         self.register_buffer(
@@ -645,7 +647,10 @@ class FcLayer(PCLayer):
 
     @property
     def pi(self):
-        return torch.exp(self.log_pi)
+        if self.use_precision:
+            return torch.exp(self.log_pi)
+        else:
+            return torch.ones_like(self.log_pi)
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -687,7 +692,7 @@ class FcLayer(PCLayer):
         bu_err : tensor (batch_size, n_units)
             The bottom-up error that needs to propagate to the next layer.
         """
-        self.bu_err = self.state - self.reconstruction
+        self.bu_err = self.state - self.reconstruction #epsilon_l
         self.td_err = -self.bu_err  # self.reconstruction - self.state
 
         if not self.clamped:
@@ -701,7 +706,7 @@ class FcLayer(PCLayer):
                 denom = c_out + top_down + 1e-6
                 self.denom = denom
             bu_err = F.linear(bu_err, weight)
-            self.pred_err = bu_err
+            self.pred_err = bu_err # epsilon_l-1
             if top_down is None:
                 top_down = self.top_down
             if top_down:
