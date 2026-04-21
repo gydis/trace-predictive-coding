@@ -166,6 +166,11 @@ def _pad_features_for_sliding_window(features: torch.Tensor, conv_ph: int) -> to
     pad = torch.zeros(features.shape[0], conv_ph - 1, features.shape[2], device=features.device)
     return torch.cat([pad, features], dim=1)
 
+def _update_precisions(model) -> None:
+    for layer in model.layers:
+        if hasattr(layer, "update_precision"):
+            layer.update_precision()
+
 
 def _zero_input(features: torch.Tensor, cnn: bool, convolved_phonemes: int = 3) -> torch.Tensor:
     if cnn:
@@ -394,6 +399,8 @@ def _run_cnn_sequence(
     zero_inp = _zero_input(features, cnn=True, convolved_phonemes=conv_ph)
     _, loss_bw_t, final_losses = model.backward()
     out = model.forward(zero_inp, step=config.step)
+
+    _update_precisions(model)
 
     if not config.mask_padding:
         loss_fw = F.cross_entropy(out, labels_ind)
@@ -696,7 +703,7 @@ def train_trace_model(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
     else: 
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
 

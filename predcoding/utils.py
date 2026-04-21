@@ -8,6 +8,7 @@ from dataloader import TraceDataset
 import torch
 import random
 from training import evaluate_trace_model
+import numpy as np
 
 
 def plot_history(history, label="", mpl=(None, None)):

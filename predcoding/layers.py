@@ -213,7 +213,7 @@ class ConvLayer(PCLayer):
         self.weight_norm = nn.Parameter(
             torch.norm(self.weight.view(self.out_channels, -1), dim=1, keepdim=True)
         )
-        self.log_pi = nn.Parameter(torch.zeros(1))
+        self.register_buffer("log_pi", torch.zeros(1))
 
     @property
     def pi(self):
@@ -221,6 +221,17 @@ class ConvLayer(PCLayer):
             return torch.exp(self.log_pi)
         else:
             return torch.ones_like(self.log_pi)
+
+    def update_precision(self):
+        with torch.no_grad():
+            mse = (self.state - self.reconstruction).pow(2).mean()
+            # Don't update if states are essentially zero - 
+            # precision has no meaningful signal yet
+            if mse < 1e-3:
+                return
+            log_pi = -torch.log(mse + 1e-6)
+            self.log_pi = torch.clamp(log_pi, min=-2.0, max=2.0)
+
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -349,8 +360,9 @@ class ConvLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
-                  / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
+        losses = 0.5 * self.pi * (self.state - self.reconstruction).pow(2) #- 0.5 * self.log_pi
+        # losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
+        #           / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
         return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
@@ -650,7 +662,7 @@ class FcLayer(PCLayer):
         if self.use_sparse_weight_norm: 
             self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
 
-        self.log_pi = nn.Parameter(torch.zeros(1))
+        self.register_buffer("log_pi", torch.zeros(1))
 
     @property
     def pi(self):
@@ -658,6 +670,16 @@ class FcLayer(PCLayer):
             return torch.exp(self.log_pi)
         else:
             return torch.ones_like(self.log_pi)
+
+    def update_precision(self):
+        with torch.no_grad():
+            mse = (self.state - self.reconstruction).pow(2).mean()
+            # Don't update if states are essentially zero - 
+            # precision has no meaningful signal yet
+            if mse < 1e-3:
+                return
+            log_pi = -torch.log(mse + 1e-6)
+            self.log_pi = torch.clamp(log_pi, min=-2.0, max=2.0)
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -768,8 +790,16 @@ class FcLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
-                  / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
+
+        # print(f"state mean sq: {self.state.square().mean().item():.4f}")
+        # print(f"recon mean sq: {self.reconstruction.square().mean().item():.4f}")
+        # print(f"error mean sq: {(self.state - self.reconstruction).square().mean().item():.4f}")
+        # print(f"pi: {self.pi.item():.4f}")
+        # print(f"log_pi: {self.log_pi.item():.4f}")
+        
+        losses = 0.5 * self.pi * (self.state - self.reconstruction).pow(2)# - 0.5 * self.log_pi
+        # losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
+        #           / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
         return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
@@ -909,8 +939,8 @@ class InputLayer(PCLayer):
             from the layer above and the state of the layer.
         """
         self.reconstruction = reconstruction
-        losses = (F.mse_loss(self.reconstruction, self.state, reduction='none') 
-                  / self.state.square().mean())
+        losses = (F.mse_loss(self.reconstruction, self.state, reduction='none'))
+                #   / self.state.square().mean())
         return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
