@@ -43,7 +43,7 @@ class TraceDataset(Dataset):
     def __getitem__(self, idx):
         return {
             'word': self.words[idx],
-            'features': self.word_features[idx],
+            'features': self.word_features[idx] / 8.0,  # Normalize features to [0, 1]
             'index': self.word_indices[idx],
             'word_padded': self.words_padded[idx]
         }

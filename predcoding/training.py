@@ -301,7 +301,9 @@ def _run_fc_sequence(
         input_feat = features[:, i, :]
         model.clamp(input_data=input_feat)
         for _ in range(config.steps_per_phoneme):
-            _, loss_bw_t, final_losses = model.backward()
+            if config.mask_padding:
+                mask = lengths == i + 1
+            _, loss_bw_t, final_losses = model.backward(mask=mask if config.mask_padding else None)
             out = model.forward(input_feat, step=config.step)
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
                 model, word_padded, i, config, device, seq_len
@@ -329,6 +331,9 @@ def _run_fc_sequence(
         loss_fw = F.cross_entropy(out, labels_ind)
         loss_bw = loss_bw_t
         acc_layer_losses = final_losses
+    else:
+        loss_fw = loss_fw / len(labels_ind)
+        loss_bw = loss_bw / len(labels_ind)
 
     return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
 
@@ -366,7 +371,9 @@ def _run_cnn_sequence(
         input_feat = window.permute(0, 2, 1).unsqueeze(2)         # (B, 7, 1, conv_ph)
         model.clamp(input_data=input_feat)
         for _ in range(config.steps_per_phoneme):
-            _, loss_bw_t, final_losses = model.backward()
+            if config.mask_padding:
+                mask = lengths == orig_pos + 1
+            _, loss_bw_t, final_losses = model.backward(mask=mask if config.mask_padding else None)
             out = model.forward(input_feat, step=config.step)
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
                 model, word_padded, orig_pos, config, device, seq_len
@@ -394,6 +401,7 @@ def _run_cnn_sequence(
         acc_layer_losses = final_losses
     else:
         loss_fw = loss_fw / len(labels_ind)
+        loss_bw = loss_bw / len(labels_ind)
 
     return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
 
@@ -716,7 +724,8 @@ def train_trace_model(
                     pbar.set_description(
                         f"Epoch {epoch}/{config.epochs} "
                         f"Loss: {metrics['loss']:.4f} Acc: {metrics['acc']:.2f}, "
-                        f"Val {history['val_acc'][-1]:.2f}%"
+                        f"Grad Norm: {metrics['grad_norm']:.4f}, "
+                        f"FW Loss: {metrics['loss_fw']:.4f}, BW Loss: {metrics['loss_bw']:.4f}"
                     )
                     pbar.update(1)
 

@@ -162,7 +162,7 @@ class PCModel(torch.nn.Module):
         output_data = self.layers[-1](bu_err, step=step[-1], immediate=immediate)
         return output_data
 
-    def backward(self):
+    def backward(self, mask=None):
         """Perform a backward pass through the model.
 
         Returns
@@ -171,15 +171,27 @@ class PCModel(torch.nn.Module):
             The reconstruction of the input units made by the upper layers.
         """
         losses = []
-        reconstruction, loss = self.layers[-1].backward()
+        reconstruction, loss, _ = self.layers[-1].backward()
         losses.append(loss)
         for layer in self.layers[-2::-1]:
-            reconstruction, layer_loss = layer.backward(reconstruction)
+            reconstruction, layer_loss, layer_losses = layer.backward(reconstruction)
             if hasattr(layer_loss, "item"):
                 losses.append(layer_loss.detach().item())
             else:
                 losses.append(layer_loss)
-            loss = loss + layer_loss
+            if mask is None:
+                loss = loss + layer_loss
+            else:
+                if (
+                    isinstance(layer_losses, torch.Tensor)
+                    and layer_losses.ndim > 0
+                    and layer_losses.shape[0] == mask.shape[0]
+                ):
+                    per_sample = layer_losses.view(mask.shape[0], -1).mean(dim=1)  # (B,)
+                    s = (per_sample * mask.float()).sum()  # unnormalized; runner divides by B
+                else:
+                    s = layer_loss
+                loss = loss + s
         return reconstruction, loss, losses[::-1]
 
     def reset(self, batch_size=None):
@@ -519,6 +531,7 @@ def trace_cnn(
                 leakage=leakage,
                 clamp_negatives=clamp_negatives,
                 spectral_normalization=spectral_normalization,
+                use_precision=use_precision,
             ),
             # bn=BatchNormLayer(num_features=24, batch_size=batch_size),
             flatten = FlattenLayer(input_shape=(24, 1, 1), batch_size=batch_size),

@@ -160,6 +160,7 @@ class ConvLayer(PCLayer):
         use_weight_norm=True,
         clamp_negatives=False,
         spectral_normalization=False,
+        use_precision=False,
     ):
         super().__init__(batch_size, top_down, leakage)
         self.in_channels = in_channels
@@ -173,6 +174,7 @@ class ConvLayer(PCLayer):
         self.stride = _pair(stride)
         self.dilation = _pair(dilation)
         self.output_padding = _pair(output_padding)
+        self.use_precision = use_precision
 
         kH, kW = self.kernel_size
         pH, pW = self.padding
@@ -211,6 +213,14 @@ class ConvLayer(PCLayer):
         self.weight_norm = nn.Parameter(
             torch.norm(self.weight.view(self.out_channels, -1), dim=1, keepdim=True)
         )
+        self.log_pi = nn.Parameter(torch.zeros(1))
+
+    @property
+    def pi(self):
+        if self.use_precision:
+            return torch.exp(self.log_pi)
+        else:
+            return torch.ones_like(self.log_pi)
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -288,7 +298,7 @@ class ConvLayer(PCLayer):
             if top_down is None:
                 top_down = self.top_down
             if top_down:
-                pred_err = self.pred_err + top_down * self.td_err
+                pred_err = self.pred_err + top_down * self.td_err * self.pi
             else:
                 pred_err = self.pred_err
             # pred_err = pred_err / self.word_norm_fw.T
@@ -339,12 +349,9 @@ class ConvLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        # return F.relu(reconstruction), backward_loss(
-        #     self.reconstruction, F.relu(self.state)
-        # )
-        return reconstruction, backward_loss(
-            self.reconstruction, self.state
-        )
+        losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
+                  / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
+        return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
@@ -761,9 +768,9 @@ class FcLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        return reconstruction, self.pi * backward_loss(
-            self.reconstruction, self.state
-        ) + torch.log(2 * math.pi * 1 / self.pi)
+        losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
+                  / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
+        return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
@@ -902,7 +909,9 @@ class InputLayer(PCLayer):
             from the layer above and the state of the layer.
         """
         self.reconstruction = reconstruction
-        return reconstruction, backward_loss(self.reconstruction, self.state)
+        losses = (F.mse_loss(self.reconstruction, self.state, reduction='none') 
+                  / self.state.square().mean())
+        return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
@@ -1055,7 +1064,7 @@ class OutputLayer(PCLayer):
         if self.noise > 0:
             noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
             reconstruction = reconstruction + self.noise * noise
-        return F.relu(reconstruction), 0
+        return F.relu(reconstruction), 0, torch.Tensor([0])
 
     def clamp(self, state):
         """Clamp the units to a predefined state.
@@ -1140,7 +1149,7 @@ class FlattenLayer(PCLayer):
             The reconstruction of the state of the units in the previous layer
             that needs to be back-propagated.
         """
-        return reconstruction.view(self.shape), 0
+        return reconstruction.view(self.shape), 0, torch.Tensor([])
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -1219,7 +1228,7 @@ class AvgPoolLayer(PCLayer):
             The reconstruction of the state of the units in the previous layer
             that needs to be back-propagated.
         """
-        return F.interpolate(reconstruction, scale_factor=self.kernel_size), 0
+        return F.interpolate(reconstruction, scale_factor=self.kernel_size), 0, torch.Tensor([])
 
     def extra_repr(self):
         """Get some additional information about this module.
