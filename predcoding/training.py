@@ -400,7 +400,7 @@ def _run_cnn_sequence(
     _, loss_bw_t, final_losses = model.backward()
     out = model.forward(zero_inp, step=config.step)
 
-    _update_precisions(model)
+    # _update_precisions(model)
 
     if not config.mask_padding:
         loss_fw = F.cross_entropy(out, labels_ind)
@@ -732,7 +732,8 @@ def train_trace_model(
                         f"Epoch {epoch}/{config.epochs} "
                         f"Loss: {metrics['loss']:.4f} Acc: {metrics['acc']:.2f}, "
                         f"Grad Norm: {metrics['grad_norm']:.4f}, "
-                        f"FW Loss: {metrics['loss_fw']:.4f}, BW Loss: {metrics['loss_bw']:.4f}"
+                        f"FW Loss: {metrics['loss_fw']:.4f}, BW Loss: {metrics['loss_bw']:.4f}, "
+                        f"Precisions: {[f'{l}: {p:.2f}' for l, p in metrics['precisions'].items()]}, "
                     )
                     pbar.update(1)
 
