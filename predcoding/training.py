@@ -162,6 +162,11 @@ def load_trace_model(
 # Training helpers
 # ---------------------------------------------------------------------------
 
+def _pad_features_for_sliding_window(features: torch.Tensor, conv_ph: int) -> torch.Tensor:
+    pad = torch.zeros(features.shape[0], conv_ph - 1, features.shape[2], device=features.device)
+    return torch.cat([pad, features], dim=1)
+
+
 def _zero_input(features: torch.Tensor, cnn: bool, convolved_phonemes: int = 3) -> torch.Tensor:
     if cnn:
         # Shape: (B, n_features, 1, conv_ph) — matches InputLayer(n_units=(7, 1, conv_ph))
@@ -346,6 +351,7 @@ def _run_cnn_sequence(
     Returns ``(loss_fw, loss_bw, loss_phoneme, final_out, final_losses_list)``.
     """
     conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
+    stride: int = (config.cnn_params or {}).get("stride", conv_ph)
     seq_len = features.shape[1]
     loss_fw = torch.tensor(0.0, device=device)
     loss_bw = torch.tensor(0.0, device=device)
@@ -354,20 +360,20 @@ def _run_cnn_sequence(
     final_losses: list = []
     acc_layer_losses: list = []
 
-    # Start at conv_ph so the first window features[:, 0:conv_ph, :] is non-empty.
-    for i in range(conv_ph, seq_len + 1, conv_ph):
-        window = features[:, i - conv_ph:i, :]                   # (B, conv_ph, 7)
-        input_feat = window.permute(0, 2, 1).unsqueeze(2)        # (B, 7, 1, conv_ph)
+    padded = _pad_features_for_sliding_window(features, conv_ph)
+    for orig_pos in range(0, seq_len, stride):
+        window = padded[:, orig_pos:orig_pos + conv_ph, :]        # (B, conv_ph, 7)
+        input_feat = window.permute(0, 2, 1).unsqueeze(2)         # (B, 7, 1, conv_ph)
         model.clamp(input_data=input_feat)
         for _ in range(config.steps_per_phoneme):
             _, loss_bw_t, final_losses = model.backward()
             out = model.forward(input_feat, step=config.step)
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
-                model, word_padded, i, config, device, seq_len
+                model, word_padded, orig_pos, config, device, seq_len
             )
 
         if config.mask_padding:
-            mask = lengths == i
+            mask = lengths == orig_pos + 1
             if mask.any():
                 loss_fw = loss_fw + F.cross_entropy(
                     out[mask], labels_ind[mask], reduction="sum"
@@ -386,6 +392,8 @@ def _run_cnn_sequence(
         loss_fw = F.cross_entropy(out, labels_ind)
         loss_bw = loss_bw_t
         acc_layer_losses = final_losses
+    else:
+        loss_fw = loss_fw / len(labels_ind)
 
     return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
 
@@ -465,6 +473,7 @@ def _run_cnn_sequence_per_phoneme(
     logging only — weight updates have already been applied inside this function.
     """
     conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
+    stride: int = (config.cnn_params or {}).get("stride", conv_ph)
     seq_len = features.shape[1]
     loss_fw = torch.tensor(0.0, device=device)
     loss_bw = torch.tensor(0.0, device=device)
@@ -473,14 +482,15 @@ def _run_cnn_sequence_per_phoneme(
     grad_norm = 0.0
     per_layer_grad_norms: dict = {}
 
-    for i in range(conv_ph, seq_len + 1, conv_ph):
-        window = features[:, i - conv_ph:i, :]                   # (B, conv_ph, 7)
-        input_feat = window.permute(0, 2, 1).unsqueeze(2)        # (B, 7, 1, conv_ph)
+    padded = _pad_features_for_sliding_window(features, conv_ph)
+    for orig_pos in range(0, seq_len, stride):
+        window = padded[:, orig_pos:orig_pos + conv_ph, :]        # (B, conv_ph, 7)
+        input_feat = window.permute(0, 2, 1).unsqueeze(2)         # (B, 7, 1, conv_ph)
         model.clamp(input_data=input_feat)
         for _ in range(config.steps_per_phoneme):
             _, loss_bw_t, _ = model.backward()
             out = model.forward(input_feat, step=config.step)
-            ph_loss = _phoneme_forcing_loss(model, word_padded, i, config, device, seq_len)
+            ph_loss = _phoneme_forcing_loss(model, word_padded, orig_pos, config, device, seq_len)
             loss_phoneme = loss_phoneme + ph_loss
 
             step_loss = loss_bw_t + ph_loss + F.cross_entropy(out, labels_ind)
@@ -493,7 +503,7 @@ def _run_cnn_sequence_per_phoneme(
             optimizer.zero_grad()
             model.detach_states()
 
-        mask = lengths == i
+        mask = lengths == orig_pos + 1
         if mask.any():
             loss_fw = loss_fw + F.cross_entropy(
                 out[mask], labels_ind[mask], reduction="sum"
@@ -782,8 +792,10 @@ def evaluate_trace_model(
                 model.forward(zero_inp, step=config.step)
 
             if config.cnn:
-                for i in range(conv_ph, seq_len + 1, conv_ph):
-                    inp = features[:, i - conv_ph:i, :].permute(0, 2, 1).unsqueeze(2)
+                stride: int = (config.cnn_params or {}).get("stride", conv_ph)
+                padded = _pad_features_for_sliding_window(features, conv_ph)
+                for orig_pos in range(0, seq_len, stride):
+                    inp = padded[:, orig_pos:orig_pos + conv_ph, :].permute(0, 2, 1).unsqueeze(2)
                     model.clamp(input_data=inp)
                     for _ in range(config.steps_per_phoneme):
                         model.backward()

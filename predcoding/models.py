@@ -500,7 +500,7 @@ def trace_cnn(
     use_precision=False,
 ):
     width = 45
-    convolved_phonemes = 3
+    convolved_phonemes = (cnn_params or {}).get("convolved_phonemes", 3)
     model = PCModel(
         dict(
             input = InputLayer(n_units=(7, 1, convolved_phonemes), batch_size=batch_size),
