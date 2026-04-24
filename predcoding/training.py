@@ -28,7 +28,7 @@ class TraceTrainConfig:
     state_dict_path: Optional[str] = None
     state_dict_strict: bool = True
     seed: Optional[int] = None
-    num_workers: int = 0
+    num_workers: int = 4
     pin_memory: Optional[bool] = None
     drop_last: bool = True
     use_tqdm: bool = True
@@ -50,6 +50,8 @@ class TraceTrainConfig:
     mask_padding: bool = True
     use_precision: bool = False
     nadam_optimizer: bool = False
+    scheduler_min_lr: float = 1e-5
+    scheduler: bool = False
 
 
 @dataclass
@@ -455,8 +457,6 @@ def _run_fc_sequence_per_phoneme(
             step_loss.backward()
             if config.gradient_clipping != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
-            grad_norm = _compute_grad_norm(model)
-            per_layer_grad_norms = _compute_per_layer_grad_norms(model)
             optimizer.step()
             optimizer.zero_grad()
             model.detach_states()
@@ -468,6 +468,8 @@ def _run_fc_sequence_per_phoneme(
             )
             loss_bw = loss_bw + loss_bw_t
 
+    grad_norm = _compute_grad_norm(model)
+    per_layer_grad_norms = _compute_per_layer_grad_norms(model)
     return loss_fw, loss_bw, loss_phoneme, out, grad_norm, per_layer_grad_norms
 
 
@@ -512,8 +514,6 @@ def _run_cnn_sequence_per_phoneme(
             step_loss.backward()
             if config.gradient_clipping != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
-            grad_norm = _compute_grad_norm(model)
-            per_layer_grad_norms = _compute_per_layer_grad_norms(model)
             optimizer.step()
             optimizer.zero_grad()
             model.detach_states()
@@ -525,6 +525,8 @@ def _run_cnn_sequence_per_phoneme(
             )
             loss_bw = loss_bw + loss_bw_t
 
+    grad_norm = _compute_grad_norm(model)
+    per_layer_grad_norms = _compute_per_layer_grad_norms(model)
     return loss_fw, loss_bw, loss_phoneme, out, grad_norm, per_layer_grad_norms
 
 
@@ -538,6 +540,8 @@ def _train_batch(
     config: TraceTrainConfig,
     device: str,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
     **kwargs,
 ) -> Dict[str, float]:
     words, features, labels_ind, word_padded = batch.values()
@@ -633,6 +637,7 @@ def _train_batch(
         grad_norm = _compute_grad_norm(model)
         per_layer_grad_norms = _compute_per_layer_grad_norms(model)
         optimizer.step()
+        scheduler.step() if scheduler is not None else None
         layer_weight_norms = _compute_per_layer_weight_norms(model)
 
     # accuracy = (accuracy / (n_passes * labels_ind.shape[0])) * 100
@@ -702,10 +707,16 @@ def train_trace_model(
         optimizer = torch.optim.NAdam(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
+        # optimizer = torch.optim.SGD(
+        #     model.parameters(), lr=config.learning_rate)
     else: 
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
         )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs * len(train_dataloader), eta_min=config.scheduler_min_lr
+    ) if config.scheduler else None
 
     history: Dict[str, List] = {
         "loss": [], "loss_fw": [], "loss_bw": [], "grad_norm": [], "acc": [], "val_acc": [0.0], "precisions": [],
@@ -719,7 +730,7 @@ def train_trace_model(
         for epoch in range(1, config.epochs + 1):
             model.train()
             for batch in train_dataloader:
-                metrics = _train_batch(model, batch, config, device, optimizer)
+                metrics = _train_batch(model, batch, config, device, optimizer, scheduler=scheduler)
                 if epoch % 5 == 0:
                     acc, _, _, _ = evaluate_trace_model(model, train_dataloader, config)
                 for key in ("loss", "loss_fw", "loss_bw", "grad_norm", "acc", "precisions",

@@ -13,7 +13,6 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributions.normal import Normal
 
 
 class PCLayer(nn.Module):
@@ -213,6 +212,8 @@ class ConvLayer(PCLayer):
         self.weight_norm = nn.Parameter(
             torch.norm(self.weight.view(self.out_channels, -1), dim=1, keepdim=True)
         )
+        with torch.no_grad():
+            self._normed_weight = weight_norm(self.weight, self.weight_norm) if use_weight_norm else self.weight
         # self.register_buffer("log_pi", torch.zeros(1))
         self.log_pi = nn.Parameter(torch.zeros(1))
 
@@ -260,8 +261,8 @@ class ConvLayer(PCLayer):
                 self.out_height,
                 self.out_width,
             )
-        device = self.state.device
         with torch.no_grad():
+            device = self.state.device
             self.state = torch.zeros(self.shape, device=device)
             self.reconstruction = torch.zeros(self.shape, device=device)
             self.td_err = torch.zeros(self.shape, device=device)
@@ -292,22 +293,7 @@ class ConvLayer(PCLayer):
         self.bu_err = self.state - self.reconstruction
         self.td_err = -self.bu_err  # self.reconstruction - self.state
         if not self.clamped:
-            if self.use_weight_norm:
-                weight = weight_norm(self.weight, self.weight_norm)
-            else:
-                weight = self.weight
-            if self.spectral_normalization:
-                # Treat conv as a matrix multiply by flattening weight to
-                # (out_ch, in_ch*kH*kW).  For kernels smaller than the input
-                # spatial extent, D is averaged over spatial positions first.
-                kH, kW = self.kernel_size
-                W_flat = self.weight.view(self.out_channels, -1)        # (out_ch, in_ch*kH*kW)
-                D_map = (bu_err > 0).float().mean(dim=0)                # (in_ch, in_H, in_W)
-                D_flat = D_map.mean(dim=(-2, -1))                       # (in_ch,)
-                D_kernel = D_flat.unsqueeze(-1).expand(-1, kH * kW).reshape(-1)  # (in_ch*kH*kW,)
-                c = (W_flat ** 2) @ D_kernel                            # (out_ch,)
-                c_out = (W_flat.T ** 2) @ torch.ones_like(c) / W_flat.shape[0]  # (in_ch*kH*kW,)
-                self.denom = c_out + (top_down or 0) + 1e-6
+            weight = self._normed_weight
             bu_err = F.conv2d(
                 bu_err,
                 weight,
@@ -319,8 +305,9 @@ class ConvLayer(PCLayer):
             self.pred_err = bu_err
             if top_down is None:
                 top_down = self.top_down
+            pi = self.pi
             if top_down:
-                pred_err = self.pred_err + top_down * self.td_err * self.pi
+                pred_err = self.pred_err + top_down * self.td_err * pi
             else:
                 pred_err = self.pred_err
             # pred_err = pred_err / self.word_norm_fw.T
@@ -354,9 +341,10 @@ class ConvLayer(PCLayer):
         """
         self.reconstruction = reconstruction
         if self.use_weight_norm:
-            weight = weight_norm(self.weight, self.weight_norm)
+            self._normed_weight = weight_norm(self.weight, self.weight_norm)
         else:
-            weight = self.weight
+            self._normed_weight = self.weight
+        weight = self._normed_weight
         reconstruction = F.conv_transpose2d(
             # F.relu(self.state),
             self.state,
@@ -369,11 +357,9 @@ class ConvLayer(PCLayer):
             output_padding=self.output_padding,
         )
         if self.noise > 0:
-            noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
-            reconstruction = reconstruction + self.noise * noise
-        losses = 0.5 * self.pi * (self.state - self.reconstruction).pow(2) - 0.5 * self.log_pi
-        # losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
-        #           / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
+            reconstruction = reconstruction + self.noise * torch.randn_like(reconstruction)
+        pi = self.pi
+        losses = 0.5 * pi * (self.state - self.reconstruction).pow(2) - 0.5 * self.log_pi
         return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
@@ -466,6 +452,8 @@ class MiddleLayer(PCLayer):
             self.bias = None
         self.weight_norm = nn.Parameter(torch.norm(self.weight, dim=1, keepdim=True))
         self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
+        with torch.no_grad():
+            self._normed_weight = weight_norm(self.weight, self.weight_norm) if use_weight_norm else self.weight
 
     def reset(self, batch_size=None):
         """Set the values of the units to their initial state.
@@ -477,14 +465,13 @@ class MiddleLayer(PCLayer):
         """
         if batch_size is not None:
             self.batch_size = batch_size
-        device = self.state.device
         with torch.no_grad():
-            self.state = torch.zeros((self.batch_size, self.n_units), device=device)
-            self.reconstruction = torch.zeros(
-                (self.batch_size, self.n_units), device=device
-            )
-            self.td_err = torch.zeros((self.batch_size, self.n_units), device=device)
-            self.bu_err = torch.zeros((self.batch_size, self.n_units), device=device)
+            device = self.state.device
+            shape = (self.batch_size, self.n_units)
+            self.state = torch.zeros(shape, device=device)
+            self.reconstruction = torch.zeros(shape, device=device)
+            self.td_err = torch.zeros(shape, device=device)
+            self.bu_err = torch.zeros(shape, device=device)
 
     def forward(self, bu_err, step=0.1, top_down=None, leakage=None, immediate=False):
         """Update state, propagate prediction error forward.
@@ -511,10 +498,7 @@ class MiddleLayer(PCLayer):
         self.td_err = -self.bu_err  # self.reconstruction - self.state
 
         if not self.clamped:
-            if self.use_weight_norm:
-                weight = weight_norm(self.weight, self.weight_norm)
-            else:
-                weight = self.weight
+            weight = self._normed_weight
             bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err
             if top_down is None:
@@ -552,15 +536,16 @@ class MiddleLayer(PCLayer):
             that needs to be back-propagated.
         """
         self.reconstruction = reconstruction
-        weight = self.weight
         if self.use_weight_norm:
-            weight = weight_norm(weight, self.weight_norm)
+            self._normed_weight = weight_norm(self.weight, self.weight_norm)
+        else:
+            self._normed_weight = self.weight
+        weight = self._normed_weight
         if self.use_sparse_weight_norm:
             weight = sparse_norm(weight, self.sparse_norm)
         reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         if self.noise > 0:
-            noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
-            reconstruction = reconstruction + self.noise * noise
+            reconstruction = reconstruction + self.noise * torch.randn_like(reconstruction)
         return F.relu(reconstruction), backward_loss(
             self.reconstruction, F.relu(self.state)
         )
@@ -670,8 +655,12 @@ class FcLayer(PCLayer):
             self.weight_norm = nn.Parameter(
                 torch.norm(self.weight, dim=1, keepdim=True)
             )
-        if self.use_sparse_weight_norm: 
+        if self.use_sparse_weight_norm:
             self.sparse_norm = nn.Parameter(-4.0 * torch.ones([1, 1]))
+        with torch.no_grad():
+            self._normed_weight = (
+                weight_norm(self.weight, self.weight_norm) if use_weight_norm else self.weight
+            )
 
         # self.register_buffer("log_pi", torch.zeros(1))
         self.log_pi = nn.Parameter(torch.zeros(1))
@@ -713,14 +702,13 @@ class FcLayer(PCLayer):
         """
         if batch_size is not None:
             self.batch_size = batch_size
-        device = self.state.device
         with torch.no_grad():
-            self.state = torch.zeros((self.batch_size, self.n_units), device=device)
-            self.reconstruction = torch.zeros(
-                (self.batch_size, self.n_units), device=device
-            )
-            self.td_err = torch.zeros((self.batch_size, self.n_units), device=device)
-            self.bu_err = torch.zeros((self.batch_size, self.n_units), device=device)
+            device = self.state.device
+            shape = (self.batch_size, self.n_units)
+            self.state = torch.zeros(shape, device=device)
+            self.reconstruction = torch.zeros(shape, device=device)
+            self.td_err = torch.zeros(shape, device=device)
+            self.bu_err = torch.zeros(shape, device=device)
 
     def forward(self, bu_err, step=0.1, top_down=None, leakage=None, immediate=False):
         """Update state, propagate prediction error forward.
@@ -745,17 +733,10 @@ class FcLayer(PCLayer):
         """
         self.bu_err = self.state - self.reconstruction #epsilon_l
         self.td_err = -self.bu_err  # self.reconstruction - self.state
+        pi = self.pi
 
         if not self.clamped:
-            weight = self.weight
-            if self.use_weight_norm:
-                weight = weight_norm(weight, self.weight_norm)
-            if self.spectral_normalization:
-                D = (bu_err > 0).to(torch.float).mean(axis=0)
-                c = (self.weight**2) @ D
-                c_out = (self.weight.T**2) @ torch.ones_like(c) / self.weight.shape[0]
-                denom = c_out + top_down + 1e-6
-                self.denom = denom
+            weight = self._normed_weight
             bu_err = F.linear(bu_err, weight)
             self.pred_err = bu_err # epsilon_l-1
             if top_down is None:
@@ -763,7 +744,7 @@ class FcLayer(PCLayer):
             if top_down:
                 # g = torch.diag(1 / (torch.diag(weight @ torch.diag(D) @ weight.T) + top_down + 1e-6))
                 # pred_err = g @ (self.pred_err + top_down * self.td_err)
-                pred_err = (self.pred_err + top_down * self.td_err * self.pi)
+                pred_err = (self.pred_err + top_down * self.td_err * pi)
             else:
                 pred_err = self.pred_err
             # pred_err = pred_err / self.word_norm_fw
@@ -778,7 +759,7 @@ class FcLayer(PCLayer):
         if immediate:
             return self.pred_err
         else:
-            return self.bu_err * self.pi
+            return self.bu_err * pi
 
     def backward(self, reconstruction):
         """Back-propagate the reconstruction.
@@ -799,9 +780,11 @@ class FcLayer(PCLayer):
             from the layer above and the state of the layer.
         """
         self.reconstruction = reconstruction
-        weight = self.weight
         if self.use_weight_norm:
-            weight = weight_norm(weight, self.weight_norm)
+            self._normed_weight = weight_norm(self.weight, self.weight_norm)
+        else:
+            self._normed_weight = self.weight
+        weight = self._normed_weight
         if self.use_sparse_weight_norm:
             weight = sparse_norm(weight, self.sparse_norm)
         if not self.relu_state:
@@ -810,18 +793,10 @@ class FcLayer(PCLayer):
             reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         # reconstruction = F.linear(self.state, weight.T, bias=self.bias)
         if self.noise > 0:
-            noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
-            reconstruction = reconstruction + self.noise * noise
+            reconstruction = reconstruction + self.noise * torch.randn_like(reconstruction)
 
-        # print(f"state mean sq: {self.state.square().mean().item():.4f}")
-        # print(f"recon mean sq: {self.reconstruction.square().mean().item():.4f}")
-        # print(f"error mean sq: {(self.state - self.reconstruction).square().mean().item():.4f}")
-        # print(f"pi: {self.pi.item():.4f}")
-        # print(f"log_pi: {self.log_pi.item():.4f}")
-        
-        losses = 0.5 * self.pi * (self.state - self.reconstruction).pow(2) - 0.5 * self.log_pi
-        # losses = (self.pi * F.mse_loss(self.reconstruction, self.state, reduction='none') 
-        #           / self.state.square().mean() + torch.log(2 * math.pi * 1 / self.pi))
+        pi = self.pi
+        losses = 0.5 * pi * (self.state - self.reconstruction).pow(2) - 0.5 * self.log_pi
         return reconstruction, losses.mean(), losses
 
     def clamp(self, state):
@@ -1114,8 +1089,7 @@ class OutputLayer(PCLayer):
             weight = self.weight
         reconstruction = F.linear(F.relu(self.state), weight.T, bias=self.bias)
         if self.noise > 0:
-            noise = Normal(torch.zeros_like(reconstruction), scale=1).rsample()
-            reconstruction = reconstruction + self.noise * noise
+            reconstruction = reconstruction + self.noise * torch.randn_like(reconstruction)
         return F.relu(reconstruction), 0, torch.Tensor([0])
 
     def clamp(self, state):

@@ -22,6 +22,7 @@ def viz_trace(
     repeat=False,
     use_tqdm=True,
     chosen_word_ind=None,
+    config=None
 ):
     """Produce an animation of a TRACE model while it processes an input word.
 
@@ -370,6 +371,9 @@ def viz_trace(
                 else:
                     model.clamp(input_data=features[:, 0, :].clone())
                 window_idx, iter_in_phoneme = 0, 0
+                for i in range(config.zero_steps):
+                    _ = model.backward()
+                    _ = model.forward(step=step_size)
             else:
                 window_idx = (i - 1) // steps_per_phoneme
                 iter_in_phoneme = (i - 1) % steps_per_phoneme
