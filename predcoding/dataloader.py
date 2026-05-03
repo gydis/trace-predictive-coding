@@ -1,5 +1,7 @@
 from torch.utils.data import Dataset
 import torch
+import torchaudio
+from datasets import load_dataset
 
 from settings import *
 
@@ -75,3 +77,54 @@ class PhonemeDataset(Dataset):
             'features': self.phoneme_features[idx],
             'index': self.phoneme_indices[idx]
         }
+
+class SpectrogramMNIST(Dataset):
+    def __init__(self, sample_rate=16000, n_fft=512, hop_length=256):
+        self.ds = load_dataset("gilkeyio/AudioMNIST")["train"]
+        self.sample_rate = sample_rate
+        
+        self.spec_transform = torchaudio.transforms.Spectrogram(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            power=2.0  # power spectrogram
+        )
+        self.cache = {}
+
+        def collate_fn(batch):
+            specs, labels = zip(*batch)
+            specs = torch.nn.utils.rnn.pad_sequence(specs, batch_first=True)
+            return specs, labels
+        self.collate_fn = collate_fn
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        if idx in self.cache:
+            return self.cache[idx]
+        sample = self.ds[idx]
+
+        # 1. Decode audio
+        audio_decoder = sample["audio"]
+        waveform = audio_decoder.get_all_samples().data  # torch tensor
+        sr = audio_decoder.metadata.sample_rate
+
+        # 2. Resample if needed
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform, sr, self.sample_rate
+            )
+
+        # 3. Convert to mono if needed
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # 4. Compute spectrogram
+        spec = self.spec_transform(waveform)
+        spec = torch.log1p(spec).squeeze(0).T  # Remove channel dimension and transpose to (time, freq)
+        label = sample["digit"]  # Assuming 'digit' is the label column
+
+
+
+        self.cache[idx] = (spec, label)
+        return spec, label
