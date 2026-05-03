@@ -52,6 +52,7 @@ class TraceTrainConfig:
     nadam_optimizer: bool = False
     scheduler_min_lr: float = 1e-5
     scheduler: bool = False
+    use_rnn: bool = False
 
 
 @dataclass
@@ -696,6 +697,7 @@ def train_trace_model(
             clamp_negatives=config.clamp_negatives,
             spectral_normalization=config.spectral_normalization,
             use_precision=config.use_precision,
+            use_rnn=config.use_rnn,
         )
         model = trace_cnn(**model_kwargs, cnn_params=config.cnn_params) if config.cnn else trace(**model_kwargs)
 

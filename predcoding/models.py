@@ -15,6 +15,7 @@ from layers import (
     InputLayer,
     MiddleLayer,
     OutputLayer,
+    RNNPCLayer,
     cosine_accuracy,
 )
 
@@ -425,6 +426,7 @@ def trace(
     clamp_negatives=False,
     spectral_normalization=False,
     use_precision=False,
+    use_rnn=False,
 ):
     """Construct a predictive coding TRACE-like model for phoneme recognition.
     
@@ -457,7 +459,7 @@ def trace(
                 spectral_normalization=spectral_normalization,
                 use_precision=use_precision,
             ),
-            memory_layer = FcLayer(
+            memory_layer = (RNNPCLayer if use_rnn else FcLayer)(
                 n_in=15,
                 n_units=width,
                 batch_size=batch_size,
@@ -510,6 +512,7 @@ def trace_cnn(
     spectral_normalization=False,
     cnn_params=None,
     use_precision=False,
+    use_rnn=False,
 ):
     width = 45
     convolved_phonemes = (cnn_params or {}).get("convolved_phonemes", 3)
@@ -535,7 +538,7 @@ def trace_cnn(
             ),
             # bn=BatchNormLayer(num_features=24, batch_size=batch_size),
             flatten = FlattenLayer(input_shape=(24, 1, 1), batch_size=batch_size),
-            memory_layer = FcLayer(
+            memory_layer = (RNNPCLayer if use_rnn else FcLayer)(
                 n_in=24,
                 n_units=width,
                 batch_size=batch_size,

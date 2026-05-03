@@ -833,6 +833,78 @@ class FcLayer(PCLayer):
         return f"in_shape={self.n_in}, out_shape={self.n_units}"
 
 
+class RNNPCLayer(FcLayer):
+    """FcLayer augmented with a GRU that updates at every inference step.
+
+    The GRU hidden state ``h_rnn`` evolves every time ``forward()`` is called
+    and carries context across both within-phoneme inference steps *and* across
+    phoneme boundaries (full BPTT).  ``h_rnn`` is only zeroed between
+    independent words via ``reset()``.
+
+    In ``backward()``, ``h_rnn`` adds an extra top-down correction to the
+    reconstruction passed to the layer below, implementing the cross-temporal
+    generative term f_l(h_t) (Lotter et al. 2017; Millidge et al. 2022).
+
+    The GRU uses two gates:
+    - Update gate z_t: controls how much new PC-state information enters h_rnn.
+    - Reset gate r_t: controls how much stale context is suppressed, allowing
+      the model to "forget" misleading phoneme history at word boundaries.
+
+    Parameters
+    ----------
+    n_in : int
+        Dimensionality of the previous layer (reconstruction target).
+    n_units : int
+        Dimensionality of this layer's state and GRU hidden state.
+    All other parameters are forwarded to ``FcLayer``.
+    """
+
+    def __init__(self, n_in, n_units, batch_size=1, **kwargs):
+        super().__init__(n_in, n_units, batch_size=batch_size, **kwargs)
+
+        # GRU weight matrices — gru_ prefix avoids collision with FcLayer.weight
+        self.gru_Wz = nn.Linear(n_units, n_units, bias=True)
+        self.gru_Uz = nn.Linear(n_units, n_units, bias=False)
+        self.gru_Wr = nn.Linear(n_units, n_units, bias=True)
+        self.gru_Ur = nn.Linear(n_units, n_units, bias=False)
+        self.gru_Wh = nn.Linear(n_units, n_units, bias=True)
+        self.gru_Uh = nn.Linear(n_units, n_units, bias=False)
+
+        # Projects GRU hidden state into the previous layer's space (n_in).
+        # Initialized near zero so cross-phoneme context starts as a small
+        # additive correction and grows only as training warrants.
+        self.gru_W_td = nn.Linear(n_units, n_in, bias=False)
+        nn.init.zeros_(self.gru_W_td.weight)
+
+        # GRU hidden state — persists across phonemes; reset() zeroes it.
+        # Not listed in detach_states() so autograd graph carries freely
+        # across phoneme boundaries (full BPTT up to word boundary).
+        self.register_buffer("h_rnn", torch.zeros(batch_size, n_units))
+
+    def forward(self, bu_err, step=0.1, top_down=None, leakage=None, immediate=False):
+        out = super().forward(
+            bu_err, step=step, top_down=top_down, leakage=leakage, immediate=immediate
+        )
+        # GRU update from the newly-updated PC state (Lotter et al. 2017 pattern)
+        s = self.state
+        h = self.h_rnn
+        z = torch.sigmoid(self.gru_Wz(s) + self.gru_Uz(h))
+        r = torch.sigmoid(self.gru_Wr(s) + self.gru_Ur(h))
+        h_cand = torch.tanh(self.gru_Wh(s) + self.gru_Uh(r * h))
+        self.h_rnn = (1.0 - z) * h + z * h_cand
+        return out
+
+    def backward(self, reconstruction):
+        recon, loss, per_elem = super().backward(reconstruction)
+        # Additive cross-phoneme top-down correction: f_l(h_t)
+        recon = recon + self.gru_W_td(self.h_rnn)
+        return recon, loss, per_elem
+
+    def reset(self, batch_size=None):
+        super().reset(batch_size)
+        self.h_rnn = torch.zeros(self.batch_size, self.n_units, device=self.state.device)
+
+
 class InputLayer(PCLayer):
     """A predictive-coding layer that is at the bottom of the stack.
 
