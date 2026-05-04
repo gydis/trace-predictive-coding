@@ -53,6 +53,7 @@ class TraceTrainConfig:
     scheduler_min_lr: float = 1e-5
     scheduler: bool = False
     use_rnn: bool = False
+    clamp_output_to_target: bool = False
 
 
 @dataclass
@@ -185,9 +186,25 @@ def _zero_input(features: torch.Tensor, cnn: bool, convolved_phonemes: int = 3) 
     return torch.zeros_like(features[:, 0, :])
 
 
-def _run_zero_steps(model, zero_inp: torch.Tensor, config: TraceTrainConfig) -> None:
+def _target_output_clamp(
+    model: torch.nn.Module,
+    labels_ind: torch.Tensor,
+    enabled: bool,
+) -> Optional[torch.Tensor]:
+    if not enabled:
+        return None
+    num_classes = model.layers.output.state.shape[1]
+    return F.one_hot(labels_ind, num_classes=num_classes).float()
+
+
+def _run_zero_steps(
+    model,
+    zero_inp: torch.Tensor,
+    config: TraceTrainConfig,
+    output_target: Optional[torch.Tensor] = None,
+) -> None:
     for _ in range(config.zero_steps):
-        model.clamp(input_data=zero_inp)
+        model.clamp(input_data=zero_inp, output_data=output_target)
         model.backward()
         model.forward(zero_inp, step=config.step)
 
@@ -304,10 +321,11 @@ def _run_fc_sequence(
     loss_bw_t = torch.tensor(0.0, device=device)
     final_losses: list = []
     acc_layer_losses: list = []
+    output_target = _target_output_clamp(model, labels_ind, config.clamp_output_to_target)
 
     for i in range(seq_len):
         input_feat = features[:, i, :]
-        model.clamp(input_data=input_feat)
+        model.clamp(input_data=input_feat, output_data=output_target)
         for _ in range(config.steps_per_phoneme):
             if config.mask_padding:
                 mask = lengths == i + 1
@@ -372,12 +390,13 @@ def _run_cnn_sequence(
     loss_bw_t = torch.tensor(0.0, device=device)
     final_losses: list = []
     acc_layer_losses: list = []
+    output_target = _target_output_clamp(model, labels_ind, config.clamp_output_to_target)
 
     padded = _pad_features_for_sliding_window(features, conv_ph)
     for orig_pos in range(0, seq_len, stride):
         window = padded[:, orig_pos:orig_pos + conv_ph, :]        # (B, conv_ph, 7)
         input_feat = window.permute(0, 2, 1).unsqueeze(2)         # (B, 7, 1, conv_ph)
-        model.clamp(input_data=input_feat)
+        model.clamp(input_data=input_feat, output_data=output_target)
         for _ in range(config.steps_per_phoneme):
             if config.mask_padding:
                 mask = lengths == orig_pos + 1
@@ -444,10 +463,11 @@ def _run_fc_sequence_per_phoneme(
     out = None
     grad_norm = 0.0
     per_layer_grad_norms: dict = {}
+    output_target = _target_output_clamp(model, labels_ind, config.clamp_output_to_target)
 
     for i in range(seq_len):
         input_feat = features[:, i, :]
-        model.clamp(input_data=input_feat)
+        model.clamp(input_data=input_feat, output_data=output_target)
         for _ in range(config.steps_per_phoneme):
             _, loss_bw_t, _ = model.backward()
             out = model.forward(input_feat, step=config.step)
@@ -499,12 +519,13 @@ def _run_cnn_sequence_per_phoneme(
     out = None
     grad_norm = 0.0
     per_layer_grad_norms: dict = {}
+    output_target = _target_output_clamp(model, labels_ind, config.clamp_output_to_target)
 
     padded = _pad_features_for_sliding_window(features, conv_ph)
     for orig_pos in range(0, seq_len, stride):
         window = padded[:, orig_pos:orig_pos + conv_ph, :]        # (B, conv_ph, 7)
         input_feat = window.permute(0, 2, 1).unsqueeze(2)         # (B, 7, 1, conv_ph)
-        model.clamp(input_data=input_feat)
+        model.clamp(input_data=input_feat, output_data=output_target)
         for _ in range(config.steps_per_phoneme):
             _, loss_bw_t, _ = model.backward()
             out = model.forward(input_feat, step=config.step)
@@ -576,7 +597,10 @@ def _train_batch(
             features, labels_ind, word_padded, device
         )
         zero_inp = _zero_input(features, config.cnn, conv_ph)
-        _run_zero_steps(model, zero_inp, config)
+        output_target = _target_output_clamp(
+            model, labels_ind, config.clamp_output_to_target
+        )
+        _run_zero_steps(model, zero_inp, config, output_target=output_target)
 
         if config.step_optimizer_per_phoneme:
             if config.cnn:

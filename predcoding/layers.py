@@ -322,7 +322,7 @@ class ConvLayer(PCLayer):
         if immediate:
             return self.pred_err
         else:
-            return self.bu_err
+            return self.bu_err * pi
 
     def backward(self, reconstruction):
         """Back-propagate the reconstruction.
