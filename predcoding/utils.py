@@ -217,7 +217,13 @@ def pred_err_plots(model, config, dataloader, i=0):
     return pred_errs
 
 
-def pred_err_stimuli(model, config, dataloader, stimuli=[10, "w", 10, "w"]):
+def pred_err_stimuli(
+    model,
+    config,
+    dataloader,
+    stimuli=[10, "w", 10, "w"],
+    ignore_word_padding=False,
+):
     device = model.parameters().__next__().device
     conv_ph: int = (config.cnn_params or {}).get("convolved_phonemes", 3)
     stride: int = (config.cnn_params or {}).get("stride", conv_ph)
@@ -248,6 +254,14 @@ def pred_err_stimuli(model, config, dataloader, stimuli=[10, "w", 10, "w"]):
     else:
         phoneme_positions = list(range(seq_len))
 
+    def _word_positions(idx):
+        if not ignore_word_padding:
+            return phoneme_positions
+        # Keep only positions that correspond to non-padding phonemes
+        # in this specific word.
+        word_len = len(words[idx])
+        return [pos for pos in phoneme_positions if pos < word_len]
+
     with torch.no_grad():
         for s in stimuli:
             if isinstance(s, int):
@@ -277,10 +291,12 @@ def pred_err_stimuli(model, config, dataloader, stimuli=[10, "w", 10, "w"]):
                     padded_f = torch.cat([pad, features[idx:idx+1]], dim=1)
                     padded_word = ('-' * (conv_ph - 1)) + words_padded[idx]
 
-                for orig_pos in phoneme_positions:
+                for orig_pos in _word_positions(idx):
                     if config.cnn:
                         inp = padded_f[:, orig_pos:orig_pos + conv_ph, :].permute(0, 2, 1).unsqueeze(2)
                         ph_label = padded_word[orig_pos:orig_pos + conv_ph]
+                        if ignore_word_padding:
+                            ph_label = ph_label.replace("-", "")
                     else:
                         inp = features[idx:idx+1, orig_pos, :]
                         ph_label = words_padded[idx][orig_pos]

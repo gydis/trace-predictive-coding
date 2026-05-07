@@ -577,6 +577,183 @@ def trace_cnn(
 
     return model
 
+def spectral_mnist(
+    num_words=10,
+    max_word_length=None,
+    batch_size=None,
+    noise=0.0,
+    state_dict=None,
+    use_weight_norm=True,
+    use_sparse_weight_norm=False,
+    leakage=0.,
+    top_down=0.,
+    clamp_negatives=False,
+    spectral_normalization=False,
+    cnn_params=None,
+    use_precision=False,
+    use_rnn=False,
+    width=128,
+    freq_dim=None,
+    time_dim=None,
+):
+    """Construct a predictive-coding model for SpectralMNIST (AudioMNIST digits).
+
+    Expected input shape is ``(batch, 1, time_dim, freq_dim)`` where each sample is a
+    log-spectrogram image. ``time_dim`` and ``freq_dim`` must be fixed for the model;
+    pad/crop spectrograms in the dataloader accordingly.
+    """
+    del max_word_length  # kept for API compatibility with other constructors
+    params = cnn_params or {}
+
+    def _pair(v):
+        if isinstance(v, (tuple, list)):
+            if len(v) != 2:
+                raise ValueError(f"Expected a scalar or 2-tuple, got {v!r}")
+            return int(v[0]), int(v[1])
+        return int(v), int(v)
+
+    def _conv2d_out(size, kernel, padding=0, stride=1, dilation=1):
+        k_h, k_w = _pair(kernel)
+        p_h, p_w = _pair(padding)
+        s_h, s_w = _pair(stride)
+        d_h, d_w = _pair(dilation)
+        in_h, in_w = size
+        out_h = (in_h + 2 * p_h - d_h * (k_h - 1) - 1) // s_h + 1
+        out_w = (in_w + 2 * p_w - d_w * (k_w - 1) - 1) // s_w + 1
+        return out_h, out_w
+
+    def _pool2d_out(size, kernel):
+        k_h, k_w = _pair(kernel)
+        in_h, in_w = size
+        return in_h // k_h, in_w // k_w
+
+    if state_dict is not None:
+        output_state = state_dict.get("layers.output.state")
+        if output_state is not None:
+            if batch_size is None:
+                batch_size = output_state.shape[0]
+            if num_words is None:
+                num_words = output_state.shape[1]
+        input_state = state_dict.get("layers.input.state")
+        if input_state is not None and input_state.ndim == 4:
+            if time_dim is None:
+                time_dim = input_state.shape[2]
+            if freq_dim is None:
+                freq_dim = input_state.shape[3]
+
+    if time_dim is None:
+        time_dim = params.get("time_dim", params.get("convolved_times", 64))
+    if freq_dim is None:
+        freq_dim = params.get("freq_dim", 257)
+
+    conv1_channels = params.get("conv1_channels", 24)
+    conv2_channels = params.get("conv2_channels", 48)
+    conv1_kernel = params.get("conv1_kernel", (5, 5))
+    conv2_kernel = params.get("conv2_kernel", (3, 3))
+    conv1_padding = params.get("conv1_padding", (2, 2))
+    conv2_padding = params.get("conv2_padding", (1, 1))
+    conv1_stride = params.get("conv1_stride", 1)
+    conv2_stride = params.get("conv2_stride", 1)
+    pool_kernel = params.get("pool_kernel", (2, 1))
+
+    conv1_out = _conv2d_out(
+        (time_dim, freq_dim),
+        conv1_kernel,
+        padding=conv1_padding,
+        stride=conv1_stride,
+    )
+    pool1_out = _pool2d_out(conv1_out, pool_kernel)
+    conv2_out = _conv2d_out(
+        pool1_out,
+        conv2_kernel,
+        padding=conv2_padding,
+        stride=conv2_stride,
+    )
+    pool2_out = _pool2d_out(conv2_out, pool_kernel)
+    flat_h, flat_w = pool2_out
+    if flat_h < 1 or flat_w < 1:
+        raise ValueError(
+            "Spectrogram geometry collapses after conv/pool stack. "
+            f"Got time_dim={time_dim}, freq_dim={freq_dim}, "
+            f"conv1_out={conv1_out}, pool1_out={pool1_out}, "
+            f"conv2_out={conv2_out}, pool2_out={pool2_out}."
+        )
+    flatten_units = conv2_channels * flat_h * flat_w
+
+    model = PCModel(
+        dict(
+            input=InputLayer(n_units=(1, time_dim, freq_dim), batch_size=batch_size),
+            conv1=ConvLayer(
+                in_channels=1,
+                out_channels=conv1_channels,
+                in_height=time_dim,
+                in_width=freq_dim,
+                kernel_size=conv1_kernel,
+                padding=conv1_padding,
+                stride=conv1_stride,
+                dilation=1,
+                output_padding=0,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
+                use_precision=use_precision,
+            ),
+            pool1=AvgPoolLayer(kernel_size=pool_kernel, batch_size=batch_size),
+            conv2=ConvLayer(
+                in_channels=conv1_channels,
+                out_channels=conv2_channels,
+                in_height=pool1_out[0],
+                in_width=pool1_out[1],
+                kernel_size=conv2_kernel,
+                padding=conv2_padding,
+                stride=conv2_stride,
+                dilation=1,
+                output_padding=0,
+                batch_size=batch_size,
+                use_weight_norm=use_weight_norm,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
+                use_precision=use_precision,
+            ),
+            pool2=AvgPoolLayer(kernel_size=pool_kernel, batch_size=batch_size),
+            flatten=FlattenLayer(
+                input_shape=(conv2_channels, flat_h, flat_w),
+                batch_size=batch_size,
+            ),
+            memory_layer=(RNNPCLayer if use_rnn else FcLayer)(
+                n_in=flatten_units,
+                n_units=width,
+                batch_size=batch_size,
+                noise=noise,
+                use_weight_norm=use_weight_norm,
+                use_sparse_weight_norm=use_sparse_weight_norm,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+                spectral_normalization=spectral_normalization,
+                use_precision=use_precision,
+            ),
+            output=OutputLayer(
+                n_in=width,
+                n_units=num_words,
+                batch_size=batch_size,
+                noise=noise,
+                leakage=leakage,
+                clamp_negatives=clamp_negatives,
+            ),
+        ),
+        leakage=leakage,
+        top_down=top_down,
+    )
+
+    if state_dict is not None:
+        model.load_state_dict(state_dict)
+
+    return model
+
+
 
 def viswordrec_lex(
     n_classes=None,

@@ -6,9 +6,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataloader import TraceDataset
-from models import trace, trace_cnn
+from dataloader import SpectrogramMNIST, TraceDataset, trace_collate_fn
+from models import spectral_mnist, trace, trace_cnn
 from settings import PHONEME_TO_INDEX
+
+ZERO_PHONEME = "-"
+ZERO_PHONEME_INDEX = PHONEME_TO_INDEX[ZERO_PHONEME]
 
 
 @dataclass
@@ -48,6 +51,7 @@ class TraceTrainConfig:
     cnn_params: Optional[Dict] = None
     reset_model_each_batch: bool = False
     mask_padding: bool = True
+    learn_padding: bool = False
     use_precision: bool = False
     nadam_optimizer: bool = False
     scheduler_min_lr: float = 1e-5
@@ -63,6 +67,59 @@ class TraceTrainResult:
     train_dataloader: DataLoader
     val_dataloader: DataLoader
     config: TraceTrainConfig
+
+
+@dataclass
+class MnistTrainConfig:
+    num_classes: int = 10
+    test_split: float = 0.2
+    epochs: int = 20
+    batch_size: Optional[int] = 64
+    learning_rate: float = 1e-3
+    device: Optional[str] = None
+    state_dict_path: Optional[str] = None
+    state_dict_strict: bool = True
+    seed: Optional[int] = None
+    num_workers: int = 4
+    pin_memory: Optional[bool] = None
+    drop_last: bool = True
+    use_tqdm: bool = True
+    sample_rate: int = 16000
+    n_fft: int = 256
+    hop_length: int = 128
+    time_dim: Optional[int] = 64
+    inference_steps: int = 8
+    step: float = 0.05
+    zero_steps: int = 0
+    reset_model_each_batch: bool = True
+    noise: float = 0.0
+    width: int = 128
+    use_weight_norm: bool = True
+    use_sparse_weight_norm: bool = False
+    leakage: float = 0.0
+    top_down: float = 0.0
+    clamp_negatives: bool = False
+    use_precision: bool = False
+    use_rnn: bool = False
+    cnn_params: Optional[Dict] = None
+    weight_decay: float = 0.0
+    gradient_clipping: float = 0.0
+    loss_fw_weight: float = 1.0
+    loss_bw_weight: float = 1.0
+    nadam_optimizer: bool = False
+    scheduler_min_lr: float = 1e-5
+    scheduler: bool = False
+    early_stop_on_train_acc: bool = False
+    early_stop_threshold: float = 99.0
+
+
+@dataclass
+class MnistTrainResult:
+    model: torch.nn.Module
+    history: Dict[str, List[float]]
+    train_dataloader: DataLoader
+    val_dataloader: DataLoader
+    config: MnistTrainConfig
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +145,62 @@ def build_trace_dataloaders(
     train_dataset, test_dataset = torch.utils.data.random_split(
         trace_dataset, [train_size, test_size], generator=generator
     )
-    if test_size == 0:
-        batch_size = len(trace_dataset)
-    else:
-        desired_batch_size = (
-            config.batch_size if config.batch_size is not None else test_size
+    desired_batch_size = config.batch_size if config.batch_size is not None else max(1, train_size)
+    if desired_batch_size is None or desired_batch_size <= 0:
+        raise ValueError(
+            f"TraceTrainConfig.batch_size must be a positive integer or None, got {config.batch_size}."
         )
-        batch_size = max(1, min(desired_batch_size, test_size))
+    train_batch_size = max(1, min(desired_batch_size, max(1, train_size)))
+    val_batch_size = max(1, min(desired_batch_size, max(1, test_size)))
+    pin_memory = (
+        _resolve_device(config.device) == "cuda"
+        if config.pin_memory is None
+        else config.pin_memory
+    )
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size,
+        shuffle=shuffle,
+        drop_last=config.drop_last,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=trace_collate_fn,
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=val_batch_size,
+        shuffle=False,
+        drop_last=config.drop_last,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=trace_collate_fn,
+    )
+    return trace_dataset, train_dataloader, test_dataloader
+
+
+def build_mnist_dataloaders(
+    config: MnistTrainConfig,
+    shuffle: bool = True,
+) -> Tuple[SpectrogramMNIST, DataLoader, DataLoader]:
+    train_dataset = SpectrogramMNIST(
+        sample_rate=config.sample_rate,
+        n_fft=config.n_fft,
+        hop_length=config.hop_length,
+        time_dim=config.time_dim,
+    )
+    test_dataset = SpectrogramMNIST(
+        sample_rate=config.sample_rate,
+        n_fft=config.n_fft,
+        hop_length=config.hop_length,
+        time_dim=config.time_dim,
+        test=True,
+    )
+    train_size = len(train_dataset)
+    test_size = len(test_dataset)
+    desired_batch_size = config.batch_size if config.batch_size is not None else 64
+    max_train_batch = max(1, train_size) if train_size > 0 else 1
+    batch_size = max(1, min(desired_batch_size, max_train_batch))
+
     pin_memory = (
         _resolve_device(config.device) == "cuda"
         if config.pin_memory is None
@@ -107,6 +213,7 @@ def build_trace_dataloaders(
         drop_last=config.drop_last,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
+        collate_fn=train_dataset.collate_fn,
     )
     test_dataloader = DataLoader(
         test_dataset,
@@ -115,8 +222,9 @@ def build_trace_dataloaders(
         drop_last=config.drop_last,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
+        collate_fn=test_dataset.collate_fn,
     )
-    return trace_dataset, train_dataloader, test_dataloader
+    return train_dataset, train_dataloader, test_dataloader
 
 
 def load_trace_model(
@@ -248,18 +356,73 @@ def _phoneme_forcing_loss(
     return loss
 
 
+def _padding_token_loss(
+    model,
+    zero_token_mask: torch.Tensor,
+    config: TraceTrainConfig,
+    device: str,
+) -> torch.Tensor:
+    if not config.learn_padding:
+        return torch.tensor(0.0, device=device)
+    if (
+        zero_token_mask is None
+        or zero_token_mask.numel() == 0
+        or not torch.any(zero_token_mask)
+    ):
+        return torch.tensor(0.0, device=device)
+    if not hasattr(model.layers, "phoneme_layer"):
+        return torch.tensor(0.0, device=device)
+    phoneme_logits = model.layers.phoneme_layer.state
+    if phoneme_logits.ndim != 2 or phoneme_logits.shape[1] <= ZERO_PHONEME_INDEX:
+        return torch.tensor(0.0, device=device)
+
+    targets = torch.full(
+        (int(zero_token_mask.sum().item()),),
+        ZERO_PHONEME_INDEX,
+        dtype=torch.long,
+        device=device,
+    )
+    return F.cross_entropy(phoneme_logits[zero_token_mask], targets, reduction="sum")
+
+
 def _permute_batch(
     features: torch.Tensor,
     labels_ind: torch.Tensor,
+    lengths: torch.Tensor,
     word_padded: List[str],
     device: str,
-) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
     perm = torch.randperm(features.size(0))
+    perm_list = perm.tolist()
     return (
         features[perm].to(device),
         labels_ind[perm].to(device),
-        [word_padded[j] for j in perm],
+        lengths[perm].to(device),
+        [word_padded[j] for j in perm_list],
     )
+
+
+def _unpack_trace_batch(
+    batch,
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[str], torch.Tensor]:
+    if not isinstance(batch, dict):
+        raise ValueError(
+            "Expected TRACE batch as a dict with keys "
+            "('word', 'features', 'index', 'word_padded', 'lengths')."
+        )
+    required = ("word", "features", "index", "word_padded")
+    missing = [key for key in required if key not in batch]
+    if missing:
+        raise ValueError(f"TRACE batch is missing keys: {missing}")
+
+    words = list(batch["word"])
+    features = batch["features"]
+    labels_ind = batch["index"]
+    word_padded = list(batch["word_padded"])
+    lengths = batch.get("lengths")
+    if lengths is None:
+        lengths = torch.tensor([len(w) for w in words], dtype=torch.long)
+    return words, features, labels_ind, word_padded, lengths
 
 
 def _compute_grad_norm(model) -> float:
@@ -318,6 +481,7 @@ def _run_fc_sequence(
     loss_fw = torch.tensor(0.0, device=device)
     loss_bw = torch.tensor(0.0, device=device)
     loss_phoneme = torch.tensor(0.0, device=device)
+    loss_padding_fw = torch.tensor(0.0, device=device)
     loss_bw_t = torch.tensor(0.0, device=device)
     final_losses: list = []
     acc_layer_losses: list = []
@@ -333,6 +497,10 @@ def _run_fc_sequence(
             out = model.forward(input_feat, step=config.step)
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
                 model, word_padded, i, config, device, seq_len
+            )
+            zero_mask = torch.all(input_feat == 0, dim=1)
+            loss_padding_fw = loss_padding_fw + _padding_token_loss(
+                model, zero_mask, config, device
             )
 
         if config.mask_padding:
@@ -352,13 +520,19 @@ def _run_fc_sequence(
     zero_inp = _zero_input(features, cnn=False)
     _, loss_bw_t, final_losses = model.backward()
     out = model.forward(zero_inp, step=config.step)
+    zero_mask = torch.ones(
+        zero_inp.shape[0], dtype=torch.bool, device=zero_inp.device
+    )
+    loss_padding_fw = loss_padding_fw + _padding_token_loss(
+        model, zero_mask, config, device
+    )
 
     if not config.mask_padding:
-        loss_fw = F.cross_entropy(out, labels_ind)
+        loss_fw = F.cross_entropy(out, labels_ind) + (loss_padding_fw / len(labels_ind))
         loss_bw = loss_bw_t
         acc_layer_losses = final_losses
     else:
-        loss_fw = loss_fw / len(labels_ind)
+        loss_fw = (loss_fw + loss_padding_fw) / len(labels_ind)
         loss_bw = loss_bw / len(labels_ind)
 
     return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
@@ -387,6 +561,7 @@ def _run_cnn_sequence(
     loss_fw = torch.tensor(0.0, device=device)
     loss_bw = torch.tensor(0.0, device=device)
     loss_phoneme = torch.tensor(0.0, device=device)
+    loss_padding_fw = torch.tensor(0.0, device=device)
     loss_bw_t = torch.tensor(0.0, device=device)
     final_losses: list = []
     acc_layer_losses: list = []
@@ -405,6 +580,10 @@ def _run_cnn_sequence(
             loss_phoneme = loss_phoneme + _phoneme_forcing_loss(
                 model, word_padded, orig_pos, config, device, seq_len
             )
+            zero_mask = torch.all(input_feat.reshape(input_feat.shape[0], -1) == 0, dim=1)
+            loss_padding_fw = loss_padding_fw + _padding_token_loss(
+                model, zero_mask, config, device
+            )
 
         if config.mask_padding:
             mask = lengths == orig_pos + 1
@@ -421,15 +600,21 @@ def _run_cnn_sequence(
     zero_inp = _zero_input(features, cnn=True, convolved_phonemes=conv_ph)
     _, loss_bw_t, final_losses = model.backward()
     out = model.forward(zero_inp, step=config.step)
+    zero_mask = torch.ones(
+        zero_inp.shape[0], dtype=torch.bool, device=zero_inp.device
+    )
+    loss_padding_fw = loss_padding_fw + _padding_token_loss(
+        model, zero_mask, config, device
+    )
 
     # _update_precisions(model)
 
     if not config.mask_padding:
-        loss_fw = F.cross_entropy(out, labels_ind)
+        loss_fw = F.cross_entropy(out, labels_ind) + (loss_padding_fw / len(labels_ind))
         loss_bw = loss_bw_t
         acc_layer_losses = final_losses
     else:
-        loss_fw = loss_fw / len(labels_ind)
+        loss_fw = (loss_fw + loss_padding_fw) / len(labels_ind)
         loss_bw = loss_bw / len(labels_ind)
 
     return loss_fw, loss_bw, loss_phoneme, out, acc_layer_losses
@@ -460,6 +645,7 @@ def _run_fc_sequence_per_phoneme(
     loss_fw = torch.tensor(0.0, device=device)
     loss_bw = torch.tensor(0.0, device=device)
     loss_phoneme = torch.tensor(0.0, device=device)
+    loss_padding_fw = torch.tensor(0.0, device=device)
     out = None
     grad_norm = 0.0
     per_layer_grad_norms: dict = {}
@@ -473,8 +659,16 @@ def _run_fc_sequence_per_phoneme(
             out = model.forward(input_feat, step=config.step)
             ph_loss = _phoneme_forcing_loss(model, word_padded, i, config, device, seq_len)
             loss_phoneme = loss_phoneme + ph_loss
+            zero_mask = torch.all(input_feat == 0, dim=1)
+            padding_fw_t = _padding_token_loss(model, zero_mask, config, device)
+            loss_padding_fw = loss_padding_fw + padding_fw_t
 
-            step_loss = loss_bw_t + ph_loss + F.cross_entropy(out, labels_ind)
+            step_loss = (
+                loss_bw_t
+                + ph_loss
+                + F.cross_entropy(out, labels_ind)
+                + (padding_fw_t / len(labels_ind))
+            )
             step_loss.backward()
             if config.gradient_clipping != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
@@ -489,6 +683,7 @@ def _run_fc_sequence_per_phoneme(
             )
             loss_bw = loss_bw + loss_bw_t
 
+    loss_fw = loss_fw + loss_padding_fw
     grad_norm = _compute_grad_norm(model)
     per_layer_grad_norms = _compute_per_layer_grad_norms(model)
     return loss_fw, loss_bw, loss_phoneme, out, grad_norm, per_layer_grad_norms
@@ -516,6 +711,7 @@ def _run_cnn_sequence_per_phoneme(
     loss_fw = torch.tensor(0.0, device=device)
     loss_bw = torch.tensor(0.0, device=device)
     loss_phoneme = torch.tensor(0.0, device=device)
+    loss_padding_fw = torch.tensor(0.0, device=device)
     out = None
     grad_norm = 0.0
     per_layer_grad_norms: dict = {}
@@ -531,8 +727,16 @@ def _run_cnn_sequence_per_phoneme(
             out = model.forward(input_feat, step=config.step)
             ph_loss = _phoneme_forcing_loss(model, word_padded, orig_pos, config, device, seq_len)
             loss_phoneme = loss_phoneme + ph_loss
+            zero_mask = torch.all(input_feat.reshape(input_feat.shape[0], -1) == 0, dim=1)
+            padding_fw_t = _padding_token_loss(model, zero_mask, config, device)
+            loss_padding_fw = loss_padding_fw + padding_fw_t
 
-            step_loss = loss_bw_t + ph_loss + F.cross_entropy(out, labels_ind)
+            step_loss = (
+                loss_bw_t
+                + ph_loss
+                + F.cross_entropy(out, labels_ind)
+                + (padding_fw_t / len(labels_ind))
+            )
             step_loss.backward()
             if config.gradient_clipping != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
@@ -547,6 +751,7 @@ def _run_cnn_sequence_per_phoneme(
             )
             loss_bw = loss_bw + loss_bw_t
 
+    loss_fw = loss_fw + loss_padding_fw
     grad_norm = _compute_grad_norm(model)
     per_layer_grad_norms = _compute_per_layer_grad_norms(model)
     return loss_fw, loss_bw, loss_phoneme, out, grad_norm, per_layer_grad_norms
@@ -566,11 +771,13 @@ def _train_batch(
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     **kwargs,
 ) -> Dict[str, float]:
-    words, features, labels_ind, word_padded = batch.values()
-    lengths = torch.tensor([len(w) for w in words], device=device)
+    _, features, labels_ind, word_padded, lengths = _unpack_trace_batch(batch)
+    features = features.to(device)
+    labels_ind = labels_ind.to(device)
+    lengths = lengths.to(device)
 
-    if config.reset_model_each_batch:
-        model.reset()
+    if config.reset_model_each_batch or model.batch_size != features.shape[0]:
+        model.reset(batch_size=features.shape[0])
     else:
         model.detach_states()
     optimizer.zero_grad()
@@ -593,8 +800,8 @@ def _train_batch(
     accuracy = 0.0
 
     for w in range(n_passes):
-        features, labels_ind, word_padded = _permute_batch(
-            features, labels_ind, word_padded, device
+        features, labels_ind, lengths, word_padded = _permute_batch(
+            features, labels_ind, lengths, word_padded, device
         )
         zero_inp = _zero_input(features, config.cnn, conv_ph)
         output_target = _target_output_clamp(
@@ -668,7 +875,6 @@ def _train_batch(
     # accuracy = (accuracy / (n_passes * labels_ind.shape[0])) * 100
     log_fw = last_loss_fw if config.step_optimizer_per_phoneme else acc_loss_fw
     log_bw = last_loss_bw if config.step_optimizer_per_phoneme else acc_loss_bw
-    layer_backward_losses = {f"layer_{i}": v for i, v in enumerate(final_losses_list)}
     precisions = {f"layer_{i}": model.layers[i].pi.mean().item() for i in range(len(model.layers)) if hasattr(model.layers[i], "pi")}
     return {
         "loss": loss.item(),
@@ -710,10 +916,11 @@ def train_trace_model(
             output_state = state_dict.get("layers.output.state")
             if output_state is not None:
                 config.num_words = output_state.shape[1]
+        model_batch_size = train_dataloader.batch_size or config.batch_size or 1
         model_kwargs = dict(
             num_words=config.num_words,
             max_word_length=dataset.max_word_length,
-            batch_size=train_dataloader.batch_size,
+            batch_size=model_batch_size,
             noise=config.noise,
             use_weight_norm=config.use_weight_norm,
             use_sparse_weight_norm=config.use_sparse_weight_norm,
@@ -741,7 +948,9 @@ def train_trace_model(
         )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs * len(train_dataloader), eta_min=config.scheduler_min_lr
+        optimizer,
+        T_max=max(1, config.epochs * max(1, len(train_dataloader))),
+        eta_min=config.scheduler_min_lr,
     ) if config.scheduler else None
 
     history: Dict[str, List] = {
@@ -790,6 +999,255 @@ def train_trace_model(
 
 
 # ---------------------------------------------------------------------------
+# SpectralMNIST training
+# ---------------------------------------------------------------------------
+
+def _unpack_mnist_batch(batch):
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        raise ValueError(
+            "Expected SpectrogramMNIST batch as (specs, labels) or (specs, labels, lengths)."
+        )
+    specs = batch[0]
+    labels = batch[1]
+    lengths = batch[2] if len(batch) > 2 else None
+    return specs, labels, lengths
+
+
+def _run_spectral_inference(
+    model: torch.nn.Module,
+    specs: torch.Tensor,
+    config: MnistTrainConfig,
+) -> Tuple[torch.Tensor, torch.Tensor, list]:
+    bw_losses = []
+    out = None
+    final_losses = []
+    for _ in range(config.inference_steps):
+        model.clamp(input_data=specs)
+        _, loss_bw_t, final_losses = model.backward()
+        out = model.forward(specs, step=config.step)
+        bw_losses.append(loss_bw_t if torch.is_tensor(loss_bw_t) else specs.new_tensor(loss_bw_t))
+    if bw_losses:
+        loss_bw = torch.stack([l if l.ndim == 0 else l.mean() for l in bw_losses]).mean()
+    else:
+        loss_bw = specs.new_tensor(0.0)
+    return out, loss_bw, final_losses
+
+
+def _train_spectral_batch(
+    model: torch.nn.Module,
+    batch,
+    config: MnistTrainConfig,
+    device: str,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+) -> Dict[str, float]:
+    specs, labels, _ = _unpack_mnist_batch(batch)
+    specs = specs.to(device)
+    labels = labels.to(device)
+
+    if config.reset_model_each_batch or model.batch_size != specs.shape[0]:
+        model.reset(batch_size=specs.shape[0])
+    else:
+        model.detach_states()
+    optimizer.zero_grad()
+
+    if config.zero_steps > 0:
+        zero_inp = torch.zeros_like(specs)
+        for _ in range(config.zero_steps):
+            model.clamp(input_data=zero_inp)
+            model.backward()
+            model.forward(zero_inp, step=config.step)
+
+    out, loss_bw, final_losses_list = _run_spectral_inference(model, specs, config)
+    loss_fw = F.cross_entropy(out, labels)
+    loss = config.loss_fw_weight * loss_fw + config.loss_bw_weight * loss_bw
+
+    loss.backward()
+    if config.gradient_clipping != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+    grad_norm = _compute_grad_norm(model)
+    per_layer_grad_norms = _compute_per_layer_grad_norms(model)
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
+    layer_weight_norms = _compute_per_layer_weight_norms(model)
+
+    acc = out.argmax(dim=1).eq(labels).float().mean().item() * 100.0
+    layer_backward_losses = {f"layer_{i}": v for i, v in enumerate(final_losses_list)}
+    precisions = {f"layer_{i}": model.layers[i].pi.mean().item() for i in range(len(model.layers)) if hasattr(model.layers[i], "pi")}
+    return {
+        "loss": loss.item(),
+        "loss_fw": loss_fw.item(),
+        "loss_bw": loss_bw.item(),
+        "grad_norm": grad_norm,
+        "acc": acc,
+        "precisions": precisions,
+        "layer_backward_losses": layer_backward_losses,
+        "layer_grad_norms": per_layer_grad_norms,
+        "layer_weight_norms": layer_weight_norms,
+    }
+
+
+def evaluate_spectral_mnist(
+    model: torch.nn.Module,
+    test_dataloader: DataLoader,
+    config: MnistTrainConfig,
+    reset: bool = True,
+):
+    device = _resolve_device(config.device)
+    model.eval()
+    accuracies = []
+    preds = []
+    targets = []
+    with torch.no_grad():
+        for batch in test_dataloader:
+            specs, labels, _ = _unpack_mnist_batch(batch)
+            specs = specs.to(device)
+            labels = labels.to(device)
+
+            if reset or model.batch_size != specs.shape[0]:
+                model.reset(batch_size=specs.shape[0])
+            else:
+                model.detach_states()
+
+            if config.zero_steps > 0:
+                zero_inp = torch.zeros_like(specs)
+                for _ in range(config.zero_steps):
+                    model.clamp(input_data=zero_inp)
+                    model.backward()
+                    model.forward(zero_inp, step=config.step)
+
+            out, _, _ = _run_spectral_inference(model, specs, config)
+            pred = out.argmax(dim=1)
+            preds.append(pred.detach().cpu())
+            targets.append(labels.detach().cpu())
+            accuracies.append(100.0 * pred.eq(labels).float().mean().item())
+
+    avg_acc = sum(accuracies) / len(accuracies) if accuracies else 0.0
+    preds_tensor = torch.cat(preds, dim=0) if preds else torch.empty(0, dtype=torch.long)
+    targets_tensor = torch.cat(targets, dim=0) if targets else torch.empty(0, dtype=torch.long)
+    return avg_acc, preds_tensor, targets_tensor
+
+
+def train_spectral_mnist(
+    config: MnistTrainConfig,
+    model: Optional[torch.nn.Module] = None,
+    dataloaders: Optional[Tuple[DataLoader, DataLoader]] = None,
+    dataset: Optional[SpectrogramMNIST] = None,
+) -> MnistTrainResult:
+    if dataloaders is None:
+        dataset, train_dataloader, val_dataloader = build_mnist_dataloaders(config)
+    else:
+        train_dataloader, val_dataloader = dataloaders
+        if model is None and dataset is None:
+            raise ValueError("dataset is required when providing dataloaders and no model.")
+
+    device = _resolve_device(config.device)
+    state_dict = None
+    if config.state_dict_path is not None:
+        state_dict = torch.load(config.state_dict_path, map_location=device)
+
+    if model is None:
+        if dataset is None:
+            raise ValueError("dataset is required to initialize spectral_mnist model.")
+        batch_size = train_dataloader.batch_size or config.batch_size or 1
+        model = spectral_mnist(
+            num_words=config.num_classes,
+            batch_size=batch_size,
+            noise=config.noise,
+            use_weight_norm=config.use_weight_norm,
+            use_sparse_weight_norm=config.use_sparse_weight_norm,
+            leakage=config.leakage,
+            top_down=config.top_down,
+            clamp_negatives=config.clamp_negatives,
+            cnn_params=config.cnn_params,
+            use_precision=config.use_precision,
+            use_rnn=config.use_rnn,
+            width=config.width,
+            time_dim=config.time_dim,
+            freq_dim=dataset.freq_dim,
+        )
+    print(model)
+    if state_dict is not None:
+        model.load_state_dict(state_dict, strict=config.state_dict_strict)
+    model = model.to(device)
+
+    if config.nadam_optimizer:
+        optimizer = torch.optim.NAdam(
+            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, config.epochs * max(1, len(train_dataloader))),
+            eta_min=config.scheduler_min_lr,
+        )
+        if config.scheduler
+        else None
+    )
+
+    history: Dict[str, List] = {
+        "loss": [],
+        "loss_fw": [],
+        "loss_bw": [],
+        "grad_norm": [],
+        "acc": [],
+        "val_acc": [0.0],
+        "precisions": [],
+        "layer_backward_losses": [],
+        "layer_grad_norms": [],
+        "layer_weight_norms": [],
+    }
+    total_steps = config.epochs * len(train_dataloader)
+    pbar = tqdm(total=total_steps, desc="Training SpectralMNIST") if config.use_tqdm else None
+
+    try:
+        acc = 0.0
+        for epoch in range(1, config.epochs + 1):
+            model.train()
+            for batch in train_dataloader:
+                metrics = _train_spectral_batch(
+                    model, batch, config, device, optimizer, scheduler=scheduler
+                )
+                for key in ("loss", "loss_fw", "loss_bw", "grad_norm", "acc", "precisions", "layer_backward_losses", "layer_grad_norms", "layer_weight_norms"):
+                    history[key].append(metrics[key])
+                if pbar is not None:
+                    pbar.set_description(
+                        f"Epoch {epoch}/{config.epochs} "
+                        f"Loss: {metrics['loss']:.4f} TrainAcc: {history['acc'][-1]:.2f}, ValAcc: {history['val_acc'][-1]:.2f}, "
+                        f"Grad Norm: {metrics['grad_norm']:.4f}, "
+                        f"FW Loss: {metrics['loss_fw']:.4f}, BW Loss: {metrics['loss_bw']:.4f}, "
+                        f"Precisions: {[f'{l}: {p:.2f}' for l, p in metrics['precisions'].items()]}, "
+                    )
+                    pbar.update(1)
+
+            val_acc, _, _ = evaluate_spectral_mnist(
+                model, val_dataloader, config, reset=True
+            )
+            history["val_acc"].append(val_acc)
+
+            if config.early_stop_on_train_acc and history["acc"] is not None:
+                if history["acc"][-1] >= config.early_stop_threshold:
+                    break
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+    return MnistTrainResult(
+        model=model,
+        history=history,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        config=config,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Legacy / convenience wrappers
 # ---------------------------------------------------------------------------
 
@@ -832,13 +1290,15 @@ def evaluate_trace_model(
     original_words = []
     with torch.no_grad():
         for batch in test_dataloader:
-            words, features, labels_ind, words_padded = batch.values()
+            words, features, labels_ind, _, _ = _unpack_trace_batch(batch)
             features = features.to(device)
             labels_ind = labels_ind.to(device)
             seq_len = features.shape[1]
 
-            if reset:
-                model.reset()
+            if reset or model.batch_size != features.shape[0]:
+                model.reset(batch_size=features.shape[0])
+            else:
+                model.detach_states()
             zero_inp = _zero_input(features, cnn=config.cnn, convolved_phonemes=conv_ph)
             for _ in range(config.zero_steps):
                 model.clamp(input_data=zero_inp)
